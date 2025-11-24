@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DDoS 防禦伺服器 - 監控面板</title>
+    <meta http-equiv="refresh" content="3">
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: white;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 30px;
+            border-radius: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        h1 {
+            margin-top: 0;
+            font-size: 2.2em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            text-align: center;
+        }
+        h2 {
+            font-size: 1.4em;
+            margin-top: 30px;
+            border-bottom: 2px solid rgba(255,255,255,0.3);
+            padding-bottom: 10px;
+        }
+        .status {
+            font-size: 1.5em;
+            margin: 20px 0;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            color: {{STATUS_COLOR}};
+            font-weight: bold;
+            text-align: center;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .stat-box {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+        }
+        .stat-box.alert {
+            border-color: #ff4444;
+            background: rgba(255, 68, 68, 0.2);
+        }
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #fff;
+        }
+        .stat-label {
+            font-size: 0.9em;
+            color: #ddd;
+            margin-top: 5px;
+        }
+        .defense-section {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+        .defense-item {
+            background: rgba(0, 255, 100, 0.1);
+            padding: 10px;
+            margin: 8px 0;
+            border-radius: 5px;
+            border-left: 4px solid #00ff64;
+        }
+        .blocked-item {
+            background: rgba(255, 0, 0, 0.1);
+            padding: 10px;
+            margin: 8px 0;
+            border-radius: 5px;
+            border-left: 4px solid #ff0000;
+        }
+        .blacklist-section {
+            background: rgba(255, 0, 0, 0.1);
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .ip-item {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 8px;
+            margin: 5px 0;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+        }
+        .report-section {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            max-height: 350px;
+            overflow-y: auto;
+        }
+        .log-entry {
+            background: rgba(0,0,0,0.3);
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+            font-size: 0.85em;
+        }
+        .shield-icon {
+            font-size: 3em;
+            text-align: center;
+            margin: 20px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="shield-icon">🛡️</div>
+        <h1>DDoS 防禦伺服器 - 即時監控</h1>
+        
+        <div class="status">{{STATUS}}</div>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-value">{{TOTAL_REQUESTS}}</div>
+                <div class="stat-label">總請求數</div>
+            </div>
+            <div class="stat-box {{BLOCKED_CLASS}}">
+                <div class="stat-value">{{BLOCKED_REQUESTS}}</div>
+                <div class="stat-label">已攔截請求</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{ALLOWED_REQUESTS}}</div>
+                <div class="stat-label">允許通過</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{REQUESTS_PER_SEC}}</div>
+                <div class="stat-label">請求速率</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{CPU_PERCENT}}</div>
+                <div class="stat-label">CPU 使用率</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{MEMORY_PERCENT}}</div>
+                <div class="stat-label">記憶體使用率</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{BLACKLIST_COUNT}}</div>
+                <div class="stat-label">黑名單 IP 數</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{UPTIME}}</div>
+                <div class="stat-label">運行時間</div>
+            </div>
+        </div>
+        
+        <h2>🛡️ 啟用的防禦機制</h2>
+        <div class="defense-section">
+            {{DEFENSE_MECHANISMS}}
+        </div>
+        
+        <h2>🚫 IP 黑名單</h2>
+        <div class="blacklist-section">
+            {{BLACKLIST_IPS}}
+        </div>
+        
+        <h2>📊 最近攔截記錄</h2>
+        <div class="report-section">
+            {{BLOCKED_LOGS}}
+        </div>
+        
+        <h2>✅ 最近允許記錄</h2>
+        <div class="report-section">
+            {{ALLOWED_LOGS}}
+        </div>
+        
+        <p style="margin-top: 30px; font-size: 0.9em; color: #ddd; text-align: center;">
+            🛡️ 防禦系統運行中 | 詳細日誌: server_defense_log.txt<br>
+            頁面每 3 秒自動刷新
+        </p>
+    </div>
+</body>
+</html>

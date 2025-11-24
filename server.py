@@ -6,10 +6,83 @@ from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import ThreadingMixIn
 import time
 import threading
+from collections import deque
+import json
+from datetime import datetime
+import os
+
+# 導入監控模組和模板渲染模組
+import server_monitor
+import template_renderer
 
 request_count = 0
 request_lock = threading.Lock()
 start_time = time.time()
+
+# 最近的請求日誌 (保留最近 50 條)
+recent_requests = deque(maxlen=50)
+requests_log_lock = threading.Lock()
+
+def get_request_count():
+    """獲取當前請求總數"""
+    with request_lock:
+        return request_count
+
+def log_request_to_file(log_entry):
+    """將請求日誌寫入文件 (只記錄不同的標頭組合)"""
+    try:
+        import os
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server_log.txt')
+        
+        # 檢查是否是獨特的標頭組合 (簡化版本 - 每種組合只記錄一次)
+        header_signature = tuple(sorted(log_entry['headers'].keys()))
+        
+        # 使用全局變數追蹤已記錄的標頭組合
+        if not hasattr(log_request_to_file, 'logged_signatures'):
+            log_request_to_file.logged_signatures = set()
+        
+        # 如果這個標頭組合已經記錄過,且不是特殊請求,則跳過
+        if header_signature in log_request_to_file.logged_signatures and log_entry.get('request_id', 0) % 100 != 0:
+            return
+        
+        log_request_to_file.logged_signatures.add(header_signature)
+        
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*100}\n")
+            f.write(f"時間: {log_entry['timestamp']}\n")
+            f.write(f"請求編號: #{log_entry['request_id']}\n")
+            f.write(f"來源 IP: {log_entry['client_ip']}\n")
+            f.write(f"請求方法: {log_entry['method']}\n")
+            f.write(f"請求路徑: {log_entry['path']}\n")
+            
+            # 封包特徵分析
+            if 'packet_features' in log_entry:
+                features = log_entry['packet_features']
+                f.write(f"\n[封包特徵分析]\n")
+                f.write(f"  請求方法: {features['method']}\n")
+                f.write(f"  路徑類型: {features['path_type']}\n")
+                f.write(f"  需要解析主體: {'是' if features['requires_parsing'] else '否'}\n")
+                f.write(f"  需要處理邏輯: {'是' if features['requires_processing'] else '否'}\n")
+                f.write(f"  需要生成響應: {'是' if features['requires_response'] else '否'}\n")
+            
+            f.write(f"\n[收到的封包標頭] (獨特組合 #{len(log_request_to_file.logged_signatures)})\n")
+            for key, value in log_entry['headers'].items():
+                f.write(f"  {key}: {value}\n")
+            
+            f.write(f"\n[伺服器底層操作 - 共 {len(log_entry['actions'])} 步]\n")
+            for idx, action in enumerate(log_entry['actions'], 1):
+                f.write(f"  {idx:2d}. {action}\n")
+            
+            f.write(f"\n[系統資源佔用]\n")
+            f.write(f"  CPU 使用率: {log_entry['cpu_percent']:.1f}%\n")
+            f.write(f"  記憶體使用率: {log_entry['memory_percent']:.1f}%\n")
+            f.write(f"  網路發送速率: {log_entry['network_sent_rate']}\n")
+            f.write(f"  網路接收速率: {log_entry['network_recv_rate']}\n")
+            f.write(f"  處理延遲: {log_entry['delay']}ms\n")
+            f.write(f"  當前狀態: {log_entry['status']}\n")
+            f.write(f"{'='*100}\n")
+    except Exception as e:
+        print(f"[日誌寫入錯誤] {e}")
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def handle(self):
@@ -22,172 +95,184 @@ class SimpleHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         global request_count
+        
+        # 獲取客戶端信息
+        client_ip = self.client_address[0]
+        request_method = self.command
+        request_path = self.path
+        
+        # 特殊處理 favicon.ico 請求
+        if request_path == '/favicon.ico':
+            with request_lock:
+                request_count += 1
+                current_count = request_count
+            
+            # 收集標頭
+            headers_dict = dict(self.headers.items())
+            
+            # 分析封包要求的底層操作
+            operations, features = server_monitor.analyze_packet_requirements(
+                request_method, request_path, headers_dict
+            )
+            
+            # 統計封包類型
+            server_monitor.update_packet_stats(request_method, request_path, headers_dict)
+            
+            # 記錄 favicon 請求到日誌
+            log_entry = {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                'request_id': current_count,
+                'client_ip': client_ip,
+                'method': request_method,
+                'path': request_path,
+                'headers': headers_dict,
+                'actions': operations,  # 使用分析得到的底層操作列表
+                'packet_features': features,
+                'cpu_percent': 0,
+                'memory_percent': 0,
+                'network_sent_rate': '0 B/s',
+                'network_recv_rate': '0 B/s',
+                'delay': 0,
+                'status': 'favicon 請求 🖼️',
+                'requests_per_sec': 0,
+            }
+            log_request_to_file(log_entry)
+            
+            # 返回 204 No Content,瀏覽器會停止重複請求
+            self.send_response(204)
+            self.end_headers()
+            return
+        
         with request_lock:
             request_count += 1
             current_count = request_count
         
+        # 收集所有 HTTP 標頭
+        headers_dict = {}
+        for header, value in self.headers.items():
+            headers_dict[header] = value
+        
+        # 分析封包要求的底層操作
+        base_operations, features = server_monitor.analyze_packet_requirements(
+            request_method, request_path, headers_dict
+        )
+        
+        # 統計封包類型
+        server_monitor.update_packet_stats(request_method, request_path, headers_dict)
+        
+        # 記錄獨特的標頭組合
+        server_monitor.record_unique_headers(headers_dict)
+        
         # 計算負載和延遲
         elapsed = time.time() - start_time
         requests_per_sec = current_count / elapsed if elapsed > 0 else 0
+        
+        # 使用基礎操作列表,並添加應用層特定操作
+        actions = base_operations.copy()
+        actions.append("\n--- 應用層操作 ---")
+        actions.append(f"[應用] 計算當前請求速率: {requests_per_sec:.2f} req/s")
         
         # 根據請求速率模擬伺服器壓力
         if requests_per_sec > 100:
             delay = 0.5  # 高負載時延遲0.5秒
             status = "嚴重過載 🔴"
             status_color = "#ff0000"
+            actions.append("[應用] 檢測到高負載 (>100 req/s)")
+            actions.append("[應用] 應用 500ms 延遲保護伺服器")
+            actions.append("[系統] 伺服器進入過載保護模式")
         elif requests_per_sec > 50:
             delay = 0.3
             status = "過載中 🟠"
             status_color = "#ff8800"
+            actions.append("[應用] 檢測到中度負載 (>50 req/s)")
+            actions.append("[應用] 應用 300ms 延遲")
         elif requests_per_sec > 20:
             delay = 0.1
             status = "負載偏高 🟡"
             status_color = "#ffcc00"
+            actions.append("[應用] 檢測到負載偏高 (>20 req/s)")
+            actions.append("[應用] 應用 100ms 延遲")
         else:
             delay = 0
             status = "正常運作 🟢"
             status_color = "#00ff00"
+            actions.append("[應用] 負載正常,無需延遲")
         
+        actions.append(f"[系統] 執行 sleep({delay}s) 模擬處理時間")
         time.sleep(delay)  # 模擬處理延遲
+        
+        # 獲取當前系統狀態
+        current_stats = server_monitor.get_system_stats()
+        
+        # 創建日誌條目
+        log_entry = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+            'request_id': current_count,
+            'client_ip': client_ip,
+            'method': request_method,
+            'path': request_path,
+            'headers': headers_dict,
+            'actions': actions,
+            'packet_features': features,  # 封包特徵分析
+            'cpu_percent': current_stats['cpu_percent'],
+            'memory_percent': current_stats['memory_percent'],
+            'network_sent_rate': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+            'network_recv_rate': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+            'delay': int(delay * 1000),
+            'status': status,
+            'requests_per_sec': requests_per_sec,
+        }
+        
+        # 添加到最近請求列表
+        with requests_log_lock:
+            recent_requests.append(log_entry)
+        
+        # 寫入日誌文件
+        log_request_to_file(log_entry)
+        
+        actions.append("發送 HTTP 200 響應")
         
         # 回應請求
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
         
-        response = f"""
-        <html>
-        <head>
-            <title>DDoS 測試伺服器</title>
-            <meta http-equiv="refresh" content="1">
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    min-height: 100vh;
-                    margin: 0;
-                }}
-                .container {{
-                    background: rgba(255, 255, 255, 0.1);
-                    backdrop-filter: blur(10px);
-                    padding: 40px;
-                    border-radius: 20px;
-                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-                    text-align: center;
-                    max-width: 600px;
-                }}
-                h1 {{
-                    margin-top: 0;
-                    font-size: 2.5em;
-                    text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-                }}
-                .status {{
-                    font-size: 1.5em;
-                    margin: 20px 0;
-                    padding: 15px;
-                    background: rgba(0, 0, 0, 0.2);
-                    border-radius: 10px;
-                    color: {status_color};
-                    font-weight: bold;
-                }}
-                .stats {{
-                    display: grid;
-                    grid-template-columns: 1fr 1fr;
-                    gap: 15px;
-                    margin: 20px 0;
-                }}
-                .stat-box {{
-                    background: rgba(0, 0, 0, 0.2);
-                    padding: 20px;
-                    border-radius: 10px;
-                }}
-                .stat-value {{
-                    font-size: 2em;
-                    font-weight: bold;
-                    color: #fff;
-                }}
-                .stat-label {{
-                    font-size: 0.9em;
-                    color: #ddd;
-                    margin-top: 5px;
-                }}
-                .spinner {{
-                    border: 8px solid rgba(255, 255, 255, 0.3);
-                    border-top: 8px solid white;
-                    border-radius: 50%;
-                    width: 60px;
-                    height: 60px;
-                    animation: spin 1s linear infinite;
-                    margin: 20px auto;
-                    display: {('block' if delay > 0 else 'none')};
-                }}
-                @keyframes spin {{
-                    0% {{ transform: rotate(0deg); }}
-                    100% {{ transform: rotate(360deg); }}
-                }}
-                .loading-bar {{
-                    width: 100%;
-                    height: 8px;
-                    background: rgba(255, 255, 255, 0.2);
-                    border-radius: 4px;
-                    overflow: hidden;
-                    margin: 20px 0;
-                }}
-                .loading-progress {{
-                    height: 100%;
-                    background: {status_color};
-                    width: {min(requests_per_sec, 100)}%;
-                    transition: width 0.3s;
-                    animation: pulse 1s infinite;
-                }}
-                @keyframes pulse {{
-                    0%, 100% {{ opacity: 1; }}
-                    50% {{ opacity: 0.5; }}
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>🖥️ DDoS 測試伺服器</h1>
-                
-                <div class="status">{status}</div>
-                
-                <div class="spinner"></div>
-                
-                <div class="loading-bar">
-                    <div class="loading-progress"></div>
+        # 生成最近請求的 HTML 報告
+        recent_logs_html = ""
+        with requests_log_lock:
+            for log in list(recent_requests)[-10:]:  # 顯示最近 10 條
+                recent_logs_html += f"""
+                <div class="log-entry">
+                    <div><strong>#{log['request_id']}</strong> | {log['timestamp']} | {log['client_ip']}</div>
+                    <div>{log['method']} {log['path']}</div>
+                    <div>CPU: {log['cpu_percent']:.1f}% | 記憶體: {log['memory_percent']:.1f}% | 延遲: {log['delay']}ms</div>
                 </div>
-                
-                <div class="stats">
-                    <div class="stat-box">
-                        <div class="stat-value">{current_count}</div>
-                        <div class="stat-label">總請求數</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-value">{requests_per_sec:.1f}</div>
-                        <div class="stat-label">請求/秒</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-value">{delay*1000:.0f}ms</div>
-                        <div class="stat-label">當前延遲</div>
-                    </div>
-                    <div class="stat-box">
-                        <div class="stat-value">{elapsed:.0f}s</div>
-                        <div class="stat-label">運行時間</div>
-                    </div>
-                </div>
-                
-                <p style="margin-top: 30px; font-size: 0.9em; color: #ddd;">
-                    ⚠️ 當請求速率超過 20/秒時伺服器會開始卡頓
-                </p>
-            </div>
-        </body>
-        </html>
-        """
+                """
+        
+        # 準備模板數據
+        template_data = {
+            'status': status,
+            'status_color': status_color,
+            'total_requests': current_count,
+            'requests_per_sec': requests_per_sec,
+            'cpu_percent': current_stats['cpu_percent'],
+            'memory_percent': current_stats['memory_percent'],
+            'network_sent': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+            'network_recv': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+            'delay': int(delay * 1000),
+            'uptime': elapsed,
+            'client_ip': client_ip,
+            'method': request_method,
+            'path': request_path,
+            'timestamp': log_entry['timestamp'],
+            'packet_features': features,
+            'headers': headers_dict,
+            'actions': actions,
+            'recent_logs_html': recent_logs_html if recent_logs_html else '<div>暫無記錄</div>',
+        }
+        
+        # 使用模板渲染響應
+        response = template_renderer.render_dashboard(template_data)
         try:
             self.wfile.write(response.encode('utf-8'))
         except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
@@ -195,9 +280,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
             pass
     
     def log_message(self, format, *args):
-        # 簡化日誌輸出
-        if request_count % 50 == 0:  # 每50個請求才輸出一次
-            print(f"[{time.strftime('%H:%M:%S')}] 請求數: {request_count}")
+        # 完全禁用終端日誌輸出,所有資訊記錄到文件
         pass
 
 class SilentHTTPServer(ThreadingHTTPServer):
@@ -223,8 +306,11 @@ def run_server(port=8000):
     httpd.daemon_threads = True  # 守護線程,主程序結束時自動結束
     httpd.request_queue_size = 100  # 增加請求隊列大小
     
+    # 啟動監控線程
+    server_monitor.start_monitoring(get_request_count, start_time)
+    
     print("="*60)
-    print("⚠️  無防禦測試伺服器 (多線程版)")
+    print("⚠️  無防禦測試伺服器 (多線程版 + 詳細報告)")
     print("="*60)
     print(f"伺服器啟動於:")
     print(f"  - 端口: {port}")
@@ -233,13 +319,45 @@ def run_server(port=8000):
     print(f"  - 防禦: ❌ 無任何防禦機制")
     print(f"  - 並發: ✅ 支持多線程處理")
     print(f"  - 隊列: {httpd.request_queue_size} 個請求")
-    print("按 Ctrl+C 停止伺服器")
+    print(f"  - 報告: ✅ 網頁顯示 + 文件記錄 (server_log.txt)")
+    print(f"  - 監控: ✅ CPU + 記憶體 + 網路速率")
+    print(f"  - 統計: ✅ 每5秒性能記錄 + 封包類型統計")
+    print("按 Ctrl+C 停止伺服器並生成完整報告")
     print("="*60 + "\n")
+    
+    # 初始化日誌文件
+    try:
+        import os
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server_log.txt')
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write(f"{'='*80}\n")
+            f.write(f"DDoS 測試伺服器日誌\n")
+            f.write(f"啟動時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"端口: {port}\n")
+            f.write(f"日誌位置: {log_path}\n")
+            f.write(f"{'='*80}\n")
+        print(f"[系統] 已初始化日誌文件: {log_path}\n")
+    except Exception as e:
+        print(f"[警告] 無法創建日誌文件: {e}\n")
+    
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n伺服器已停止")
+        print("\n\n[系統] 正在關閉伺服器...")
         httpd.shutdown()
+        
+        # 生成最終報告
+        print("[系統] 正在生成性能分析報告...")
+        report_path = server_monitor.generate_final_report(
+            request_count, 
+            start_time, 
+            os.path.dirname(os.path.abspath(__file__))
+        )
+        
+        print("\n[系統] 伺服器已關閉")
+        if report_path:
+            print(f"[系統] 性能報告已保存至: {report_path}\n")
+        print("[系統] 請求日誌: server_log.txt\n")
 
 if __name__ == '__main__':
     run_server(port=8000)  # 無防禦使用 8000 端口

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DDoS 測試伺服器 - 詳細報告</title>
+    <meta http-equiv="refresh" content="5">
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 30px;
+            border-radius: 20px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            margin-top: 0;
+            font-size: 2em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            text-align: center;
+        }
+        h2 {
+            font-size: 1.3em;
+            margin-top: 30px;
+            border-bottom: 2px solid rgba(255,255,255,0.3);
+            padding-bottom: 10px;
+        }
+        .status {
+            font-size: 1.5em;
+            margin: 20px 0;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            color: {{STATUS_COLOR}};
+            font-weight: bold;
+            text-align: center;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .stat-box {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #fff;
+        }
+        .stat-label {
+            font-size: 0.9em;
+            color: #ddd;
+            margin-top: 5px;
+        }
+        .report-section {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .header-item {
+            padding: 5px;
+            margin: 3px 0;
+            background: rgba(255,255,255,0.1);
+            border-radius: 3px;
+            font-size: 0.85em;
+        }
+        .action-item {
+            padding: 5px 10px;
+            margin: 5px 0;
+            background: rgba(0,255,0,0.1);
+            border-left: 3px solid #00ff00;
+            border-radius: 3px;
+        }
+        .log-entry {
+            background: rgba(0,0,0,0.3);
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+            text-align: left;
+            font-size: 0.8em;
+        }
+        .feature-box {
+            background: rgba(100, 150, 255, 0.2);
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border-left: 3px solid #4a90e2;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🖥️ DDoS 測試伺服器 - 詳細報告</h1>
+        
+        <div class="status">{{STATUS}}</div>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-value">{{TOTAL_REQUESTS}}</div>
+                <div class="stat-label">總請求數</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{REQUESTS_PER_SEC}}</div>
+                <div class="stat-label">請求/秒</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{CPU_PERCENT}}</div>
+                <div class="stat-label">CPU 使用率</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{MEMORY_PERCENT}}</div>
+                <div class="stat-label">記憶體使用率</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{NETWORK_SENT}}</div>
+                <div class="stat-label">網路發送</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{NETWORK_RECV}}</div>
+                <div class="stat-label">網路接收</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{DELAY}}</div>
+                <div class="stat-label">當前延遲</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{{UPTIME}}</div>
+                <div class="stat-label">運行時間</div>
+            </div>
+        </div>
+        
+        <h2>📦 本次請求詳情</h2>
+        <div class="report-section">
+            <div><strong>來源 IP:</strong> {{CLIENT_IP}}</div>
+            <div><strong>請求方法:</strong> {{METHOD}}</div>
+            <div><strong>請求路徑:</strong> {{PATH}}</div>
+            <div><strong>時間戳:</strong> {{TIMESTAMP}}</div>
+        </div>
+        
+        <h2>🔍 封包特徵分析</h2>
+        <div class="report-section">
+            {{PACKET_FEATURES}}
+        </div>
+        
+        <h2>📋 收到的封包標頭 (Headers)</h2>
+        <div class="report-section">
+            {{HEADERS}}
+        </div>
+        
+        <h2>⚙️ 伺服器底層操作</h2>
+        <div class="report-section">
+            {{ACTIONS}}
+        </div>
+        
+        <h2>📊 最近請求記錄 (最新 10 條)</h2>
+        <div class="report-section">
+            {{RECENT_LOGS}}
+        </div>
+        
+        <p style="margin-top: 30px; font-size: 0.9em; color: #ddd; text-align: center;">
+            ⚠️ 所有請求已記錄到 server_log.txt 文件<br>
+            頁面每 5 秒自動刷新 (降低 GPU 負載)
+        </p>
+    </div>
+</body>
+</html>
