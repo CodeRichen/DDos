@@ -249,7 +249,20 @@ class SimpleHandler(BaseHTTPRequestHandler):
                 </div>
                 """
         
-        # 準備模板數據
+        # 尋找最近的非 GET 根路徑請求(攻擊請求)來顯示在儀表板
+        display_request = None
+        with requests_log_lock:
+            for log in reversed(list(recent_requests)):
+                # 跳過 GET 根路徑請求(儀表板訪問)
+                if not (log['method'] == 'GET' and log['path'] == '/'):
+                    display_request = log
+                    break
+        
+        # 如果沒有找到攻擊請求,使用當前請求
+        if display_request is None:
+            display_request = log_entry
+        
+        # 準備模板數據 - 使用找到的攻擊請求而非當前 GET 請求
         template_data = {
             'status': status,
             'status_color': status_color,
@@ -261,13 +274,13 @@ class SimpleHandler(BaseHTTPRequestHandler):
             'network_recv': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
             'delay': int(delay * 1000),
             'uptime': elapsed,
-            'client_ip': client_ip,
-            'method': request_method,
-            'path': request_path,
-            'timestamp': log_entry['timestamp'],
-            'packet_features': features,
-            'headers': headers_dict,
-            'actions': actions,
+            'client_ip': display_request['client_ip'],
+            'method': display_request['method'],
+            'path': display_request['path'],
+            'timestamp': display_request['timestamp'],
+            'packet_features': display_request['packet_features'],
+            'headers': display_request['headers'],
+            'actions': display_request['actions'],
             'recent_logs_html': recent_logs_html if recent_logs_html else '<div>暫無記錄</div>',
         }
         
@@ -278,6 +291,299 @@ class SimpleHandler(BaseHTTPRequestHandler):
         except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
             # 客戶端已斷開連接
             pass
+    
+    def do_POST(self):
+        """處理 POST 請求"""
+        global request_count
+        client_ip = self.client_address[0]
+        request_method = self.command
+        request_path = self.path
+        
+        start_time = time.time()
+        
+        # 線程安全地更新請求計數
+        with request_lock:
+            request_count += 1
+            current_count = request_count
+        
+        # 讀取 POST 數據
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length) if content_length > 0 else b''
+        
+        # 收集所有請求標頭
+        headers_dict = dict(self.headers.items())
+        
+        # 分析封包的底層需求
+        actions, features = server_monitor.analyze_packet_requirements(
+            request_method, request_path, headers_dict
+        )
+        
+        # 更新統計資訊
+        server_monitor.update_packet_stats(request_method, request_path, headers_dict)
+        server_monitor.record_unique_headers(headers_dict)
+        
+        # 獲取當前系統資源統計
+        current_stats = server_monitor.get_system_stats()
+        delay = time.time() - start_time
+        
+        # 構建日誌條目
+        log_entry = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'request_id': current_count,
+            'client_ip': client_ip,
+            'method': request_method,
+            'path': request_path,
+            'headers': headers_dict,
+            'actions': actions,
+            'packet_features': features,
+            'cpu_percent': current_stats['cpu_percent'],
+            'memory_percent': current_stats['memory_percent'],
+            'network_sent_rate': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+            'network_recv_rate': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+            'delay': int(delay * 1000),
+            'post_data_size': len(post_data),
+            'status': '正常運作 🟢',
+            'requests_per_sec': 0,
+        }
+        
+        # 添加到最近請求列表
+        with requests_log_lock:
+            recent_requests.append(log_entry)
+        
+        # 寫入日誌文件
+        log_request_to_file(log_entry)
+        
+        # 發送響應
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        
+        response_data = {
+            'status': 'success',
+            'request_id': current_count,
+            'message': 'POST request received',
+            'data_received': len(post_data)
+        }
+        
+        try:
+            self.wfile.write(json.dumps(response_data).encode('utf-8'))
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            # 客戶端已斷開連接
+            pass
+    
+    def do_PUT(self):
+        """處理 PUT 請求"""
+        global request_count
+        client_ip = self.client_address[0]
+        request_method = self.command
+        request_path = self.path
+        start_time = time.time()
+        
+        with request_lock:
+            request_count += 1
+            current_count = request_count
+        
+        content_length = int(self.headers.get('Content-Length', 0))
+        put_data = self.rfile.read(content_length) if content_length > 0 else b''
+        headers_dict = dict(self.headers.items())
+        
+        actions, features = server_monitor.analyze_packet_requirements(
+            request_method, request_path, headers_dict
+        )
+        server_monitor.update_packet_stats(request_method, request_path, headers_dict)
+        server_monitor.record_unique_headers(headers_dict)
+        
+        current_stats = server_monitor.get_system_stats()
+        delay = time.time() - start_time
+        
+        log_entry = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'request_id': current_count,
+            'client_ip': client_ip,
+            'method': request_method,
+            'path': request_path,
+            'headers': headers_dict,
+            'actions': actions,
+            'packet_features': features,
+            'cpu_percent': current_stats['cpu_percent'],
+            'memory_percent': current_stats['memory_percent'],
+            'network_sent_rate': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+            'network_recv_rate': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+            'delay': int(delay * 1000),
+            'status': '正常運作 🟢',
+            'requests_per_sec': 0,
+        }
+        
+        with requests_log_lock:
+            recent_requests.append(log_entry)
+        log_request_to_file(log_entry)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        
+        response_data = {'status': 'success', 'request_id': current_count, 'message': 'PUT request received'}
+        try:
+            self.wfile.write(json.dumps(response_data).encode('utf-8'))
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            pass
+    
+    def do_DELETE(self):
+        """處理 DELETE 請求"""
+        global request_count
+        client_ip = self.client_address[0]
+        request_method = self.command
+        request_path = self.path
+        start_time = time.time()
+        
+        with request_lock:
+            request_count += 1
+            current_count = request_count
+        
+        headers_dict = dict(self.headers.items())
+        
+        actions, features = server_monitor.analyze_packet_requirements(
+            request_method, request_path, headers_dict
+        )
+        server_monitor.update_packet_stats(request_method, request_path, headers_dict)
+        server_monitor.record_unique_headers(headers_dict)
+        
+        current_stats = server_monitor.get_system_stats()
+        delay = time.time() - start_time
+        
+        log_entry = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'request_id': current_count,
+            'client_ip': client_ip,
+            'method': request_method,
+            'path': request_path,
+            'headers': headers_dict,
+            'actions': actions,
+            'packet_features': features,
+            'cpu_percent': current_stats['cpu_percent'],
+            'memory_percent': current_stats['memory_percent'],
+            'network_sent_rate': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+            'network_recv_rate': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+            'delay': int(delay * 1000),
+            'status': '正常運作 🟢',
+            'requests_per_sec': 0,
+        }
+        
+        with requests_log_lock:
+            recent_requests.append(log_entry)
+        log_request_to_file(log_entry)
+        
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        
+        response_data = {'status': 'success', 'request_id': current_count, 'message': 'DELETE request received'}
+        try:
+            self.wfile.write(json.dumps(response_data).encode('utf-8'))
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            pass
+    
+    def do_HEAD(self):
+        """處理 HEAD 請求"""
+        global request_count
+        client_ip = self.client_address[0]
+        request_method = self.command
+        request_path = self.path
+        start_time = time.time()
+        
+        with request_lock:
+            request_count += 1
+            current_count = request_count
+        
+        headers_dict = dict(self.headers.items())
+        
+        actions, features = server_monitor.analyze_packet_requirements(
+            request_method, request_path, headers_dict
+        )
+        server_monitor.update_packet_stats(request_method, request_path, headers_dict)
+        server_monitor.record_unique_headers(headers_dict)
+        
+        current_stats = server_monitor.get_system_stats()
+        delay = time.time() - start_time
+        
+        log_entry = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'request_id': current_count,
+            'client_ip': client_ip,
+            'method': request_method,
+            'path': request_path,
+            'headers': headers_dict,
+            'actions': actions,
+            'packet_features': features,
+            'cpu_percent': current_stats['cpu_percent'],
+            'memory_percent': current_stats['memory_percent'],
+            'network_sent_rate': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+            'network_recv_rate': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+            'delay': int(delay * 1000),
+            'status': '正常運作 🟢',
+            'requests_per_sec': 0,
+        }
+        
+        with requests_log_lock:
+            recent_requests.append(log_entry)
+        log_request_to_file(log_entry)
+        
+        # HEAD 請求只返回標頭,不返回內容
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+    
+    def do_OPTIONS(self):
+        """處理 OPTIONS 請求"""
+        global request_count
+        client_ip = self.client_address[0]
+        request_method = self.command
+        request_path = self.path
+        start_time = time.time()
+        
+        with request_lock:
+            request_count += 1
+            current_count = request_count
+        
+        headers_dict = dict(self.headers.items())
+        
+        actions, features = server_monitor.analyze_packet_requirements(
+            request_method, request_path, headers_dict
+        )
+        server_monitor.update_packet_stats(request_method, request_path, headers_dict)
+        server_monitor.record_unique_headers(headers_dict)
+        
+        current_stats = server_monitor.get_system_stats()
+        delay = time.time() - start_time
+        
+        log_entry = {
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'request_id': current_count,
+            'client_ip': client_ip,
+            'method': request_method,
+            'path': request_path,
+            'headers': headers_dict,
+            'actions': actions,
+            'packet_features': features,
+            'cpu_percent': current_stats['cpu_percent'],
+            'memory_percent': current_stats['memory_percent'],
+            'network_sent_rate': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+            'network_recv_rate': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+            'delay': int(delay * 1000),
+            'status': '正常運作 🟢',
+            'requests_per_sec': 0,
+        }
+        
+        with requests_log_lock:
+            recent_requests.append(log_entry)
+        log_request_to_file(log_entry)
+        
+        # OPTIONS 請求返回允許的方法
+        self.send_response(200)
+        self.send_header('Allow', 'GET, POST, PUT, DELETE, HEAD, OPTIONS')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
     
     def log_message(self, format, *args):
         # 完全禁用終端日誌輸出,所有資訊記錄到文件
