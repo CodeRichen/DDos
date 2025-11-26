@@ -23,10 +23,33 @@ start_time = time.time()
 recent_requests = deque(maxlen=50)
 requests_log_lock = threading.Lock()
 
+# 用於計算即時請求速率的時間窗口 (最近 10 秒)
+request_timestamps = deque(maxlen=1000)  # 保留最近 1000 個請求的時間戳
+timestamps_lock = threading.Lock()
+
 def get_request_count():
     """獲取當前請求總數"""
     with request_lock:
         return request_count
+
+def get_recent_request_rate():
+    """計算最近 10 秒的請求速率"""
+    current_time = time.time()
+    time_window = 10.0  # 10 秒時間窗口
+    
+    with timestamps_lock:
+        # 移除超過時間窗口的舊時間戳
+        while request_timestamps and current_time - request_timestamps[0] > time_window:
+            request_timestamps.popleft()
+        
+        # 計算速率
+        count = len(request_timestamps)
+        if count == 0:
+            return 0.0
+        
+        # 實際時間跨度
+        actual_window = current_time - request_timestamps[0] if count > 0 else time_window
+        return count / actual_window if actual_window > 0 else 0.0
 
 def log_request_to_file(log_entry):
     """將請求日誌寫入文件 (只記錄不同的標頭組合)"""
@@ -147,6 +170,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
             request_count += 1
             current_count = request_count
         
+        # 記錄請求時間戳用於計算即時速率
+        with timestamps_lock:
+            request_timestamps.append(time.time())
+        
         # 收集所有 HTTP 標頭
         headers_dict = {}
         for header, value in self.headers.items():
@@ -163,16 +190,16 @@ class SimpleHandler(BaseHTTPRequestHandler):
         # 記錄獨特的標頭組合
         server_monitor.record_unique_headers(headers_dict)
         
-        # 計算負載和延遲
+        # 計算負載和延遲 - 使用最近 10 秒的即時速率
         elapsed = time.time() - start_time
-        requests_per_sec = current_count / elapsed if elapsed > 0 else 0
+        requests_per_sec = get_recent_request_rate()  # 改用即時速率
         
         # 使用基礎操作列表,並添加應用層特定操作
         actions = base_operations.copy()
         actions.append("\n--- 應用層操作 ---")
-        actions.append(f"[應用] 計算當前請求速率: {requests_per_sec:.2f} req/s")
+        actions.append(f"[應用] 計算即時請求速率(最近10秒): {requests_per_sec:.2f} req/s")
         
-        # 根據請求速率模擬伺服器壓力
+        # 根據即時請求速率模擬伺服器壓力
         if requests_per_sec > 100:
             delay = 0.5  # 高負載時延遲0.5秒
             status = "嚴重過載 🔴"
@@ -306,6 +333,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
             request_count += 1
             current_count = request_count
         
+        # 記錄請求時間戳
+        with timestamps_lock:
+            request_timestamps.append(time.time())
+        
         # 讀取 POST 數據
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length) if content_length > 0 else b''
@@ -383,6 +414,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
             request_count += 1
             current_count = request_count
         
+        # 記錄請求時間戳
+        with timestamps_lock:
+            request_timestamps.append(time.time())
+        
         content_length = int(self.headers.get('Content-Length', 0))
         put_data = self.rfile.read(content_length) if content_length > 0 else b''
         headers_dict = dict(self.headers.items())
@@ -440,6 +475,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
             request_count += 1
             current_count = request_count
         
+        # 記錄請求時間戳
+        with timestamps_lock:
+            request_timestamps.append(time.time())
+        
         headers_dict = dict(self.headers.items())
         
         actions, features = server_monitor.analyze_packet_requirements(
@@ -495,6 +534,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
             request_count += 1
             current_count = request_count
         
+        # 記錄請求時間戳
+        with timestamps_lock:
+            request_timestamps.append(time.time())
+        
         headers_dict = dict(self.headers.items())
         
         actions, features = server_monitor.analyze_packet_requirements(
@@ -545,6 +588,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
         with request_lock:
             request_count += 1
             current_count = request_count
+        
+        # 記錄請求時間戳
+        with timestamps_lock:
+            request_timestamps.append(time.time())
         
         headers_dict = dict(self.headers.items())
         
@@ -656,8 +703,10 @@ def run_server(port=8000):
         print("[系統] 正在生成性能分析報告...")
         report_path = server_monitor.generate_final_report(
             request_count, 
-            start_time, 
-            os.path.dirname(os.path.abspath(__file__))
+            start_time,
+            blocked_count=0,  # 無防禦伺服器無攔截
+            block_reasons=None,
+            output_dir=os.path.dirname(os.path.abspath(__file__))
         )
         
         print("\n[系統] 伺服器已關閉")

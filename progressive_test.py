@@ -136,15 +136,22 @@ def print_result(result, is_severe=False):
     avg_time = result['avg_response_time']
     rate = result['request_rate']
     
-    # 判定狀態
-    if avg_time > 2.0 or success_rate < 50:
+    # 判定狀態 - 區分防禦攔截和性能卡頓
+    # 如果延遲很低但成功率低,表示是防禦系統攔截,不是性能問題
+    if avg_time > 2.0:  # 延遲超過 2 秒才算真正卡頓
         status = "🔴 嚴重卡頓"
         severe = True
-    elif avg_time > 1.0 or success_rate < 80:
+    elif avg_time > 1.0:  # 延遲超過 1 秒
         status = "🟠 明顯延遲"
         severe = False
-    elif avg_time > 0.5:
+    elif avg_time > 0.5:  # 延遲超過 500ms
         status = "🟡 輕微影響"
+        severe = False
+    elif success_rate < 30:  # 延遲低但成功率極低 = 防禦攔截
+        status = "🛡️  防禦攔截"
+        severe = False
+    elif success_rate < 50:  # 延遲低但成功率偏低
+        status = "🟡 部分攔截"
         severe = False
     else:
         status = "🟢 運作正常"
@@ -176,9 +183,10 @@ def progressive_test(target_url, attack_method, defense_enabled):
         results.append(result)
         is_severe = print_result(result)
         
-        # 如果已經嚴重卡頓,停止增加
-        if is_severe and result['success_rate'] < 30:
-            print(f"\n⚠️  伺服器已嚴重卡頓,停止增加線程")
+        # 只有真正的性能卡頓才停止測試(延遲 > 2秒)
+        # 如果只是防禦攔截,繼續測試
+        if is_severe and result['avg_response_time'] > 2.0:
+            print(f"\n⚠️  伺服器效能嚴重下降,停止增加線程")
             break
         
         time.sleep(2)  # 每次測試間隔

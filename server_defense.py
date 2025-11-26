@@ -10,11 +10,44 @@ from collections import defaultdict, deque
 import hashlib
 import json
 
+# 導入監控模組和模板渲染模組
+import server_monitor
+import template_renderer
+
 # 全局統計
 request_count = 0
 blocked_count = 0
 start_time = time.time()
 request_lock = threading.Lock()
+
+# 最近的請求日誌 (保留最近 50 條)
+recent_requests = deque(maxlen=50)
+requests_log_lock = threading.Lock()
+
+# 用於計算即時請求速率的時間窗口
+request_timestamps = deque(maxlen=1000)
+timestamps_lock = threading.Lock()
+
+def get_request_count():
+    """獲取當前請求總數"""
+    with request_lock:
+        return request_count
+
+def get_recent_request_rate():
+    """計算最近 10 秒的請求速率"""
+    current_time = time.time()
+    time_window = 10.0
+    
+    with timestamps_lock:
+        while request_timestamps and current_time - request_timestamps[0] > time_window:
+            request_timestamps.popleft()
+        
+        count = len(request_timestamps)
+        if count == 0:
+            return 0.0
+        
+        actual_window = current_time - request_timestamps[0] if count > 0 else time_window
+        return count / actual_window if actual_window > 0 else 0.0
 
 # 攔截日誌
 block_logs = deque(maxlen=100)  # 保留最近100條攔截記錄
@@ -226,8 +259,21 @@ class DefenseHandler(BaseHTTPRequestHandler):
         global request_count, blocked_count
         
         client_ip = self.client_address[0]
+        request_method = self.command
         request_path = self.path
         user_agent = self.headers.get('User-Agent', 'Unknown')
+        
+        start_request_time = time.time()
+        
+        # 如果是 POST/PUT 請求,先讀取請求體避免 TCP 緩衝區殘留
+        if request_method in ['POST', 'PUT', 'PATCH']:
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                if content_length > 0:
+                    # 快速讀取並丟棄請求體,避免阻塞
+                    self.rfile.read(content_length)
+            except (ValueError, OSError, ConnectionAbortedError, BrokenPipeError):
+                pass
         
         # 管理功能 - 清除黑名單
         if request_path == '/admin/clear-blacklist':
@@ -325,15 +371,31 @@ class DefenseHandler(BaseHTTPRequestHandler):
             if delay > 0:
                 time.sleep(delay)
             
-            # 更新統計
+            # 更新統計和時間戳
             with request_lock:
                 request_count += 1
                 current_count = request_count
                 current_blocked = blocked_count
             
-            # 計算實時數據
+            with timestamps_lock:
+                request_timestamps.append(time.time())
+            
+            # 收集 HTTP 標頭
+            headers_dict = dict(self.headers.items())
+            
+            # 分析封包要求
+            base_operations, features = server_monitor.analyze_packet_requirements(
+                request_method, request_path, headers_dict
+            )
+            
+            # 更新封包統計
+            server_monitor.update_packet_stats(request_method, request_path, headers_dict)
+            server_monitor.record_unique_headers(headers_dict)
+            
+            # 獲取系統狀態
+            current_stats = server_monitor.get_system_stats()
             elapsed = time.time() - start_time
-            rps = current_count / elapsed if elapsed > 0 else 0
+            rps = get_recent_request_rate()
             
             # 狀態判定
             if rps > 200:
@@ -349,14 +411,11 @@ class DefenseHandler(BaseHTTPRequestHandler):
                 status = "🟢 正常運作"
                 status_color = "#00ff00"
             
+            # 防禦統計
             defense_stats = defense_system.get_stats()
             
-            # 防禦狀態顯示
-            active_defenses = [k for k, v in defense_config.items() if v]
-            defense_status = "🛡️ 啟用" if active_defenses else "❌ 關閉"
-            
             # 獲取最近攔截記錄
-            recent_blocks = defense_system.get_recent_blocks(5)
+            recent_blocks = defense_system.get_recent_blocks(10)
             
             # 獲取當前IP分析
             ip_analysis = defense_system.get_ip_analysis(client_ip)
@@ -364,325 +423,111 @@ class DefenseHandler(BaseHTTPRequestHandler):
             # 攔截原因統計
             top_block_reasons = sorted(block_reasons.items(), key=lambda x: x[1], reverse=True)[:5]
             
+            # 防禦機制列表
+            defense_mechanisms = []
+            for key, enabled in defense_config.items():
+                status_badge = "✅" if enabled else "❌"
+                mechanism_names = {
+                    'rate_limiting': f"{status_badge} 速率限制 (20 req/10s)",
+                    'ip_blacklist': f"{status_badge} IP 黑名單 (30秒封鎖)",
+                    'connection_limit': f"{status_badge} 連接數限制 (10 concurrent)",
+                    'challenge_response': f"{status_badge} 挑戰-響應驗證",
+                    'request_validation': f"{status_badge} 請求驗證 (Headers)",
+                    'adaptive_delay': f"{status_badge} 自適應延遲 (動態)"
+                }
+                defense_mechanisms.append({
+                    'name': mechanism_names.get(key, key),
+                    'enabled': enabled
+                })
+            
+            # 生成黑名單 IP 列表
+            blacklist_ips = []
+            for ip, until_time in defense_system.ip_blocked.items():
+                remaining = int(until_time - time.time())
+                if remaining > 0:
+                    blacklist_ips.append(f"{ip} (剩餘 {remaining}秒)")
+            
+            # 生成攔截日誌
+            blocked_logs = []
+            for log in reversed(recent_blocks):
+                blocked_logs.append(
+                    f"[{log['time']}] {log['reason']} - IP: {log['ip']} | {log['details']}"
+                )
+            
+            # 生成允許日誌 (最近成功的請求)
+            allowed_logs = []
+            with requests_log_lock:
+                for log in list(recent_requests)[-10:]:
+                    allowed_logs.append(
+                        f"#{log.get('request_id', '?')} | {log.get('timestamp', '?')} | {log.get('client_ip', '?')} | {log.get('method', '?')} {log.get('path', '?')}"
+                    )
+            
+            # 計算處理時間
+            process_delay = int((time.time() - start_request_time) * 1000)
+            
+            # 構建日誌條目
+            log_entry = {
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'request_id': current_count,
+                'client_ip': client_ip,
+                'method': request_method,
+                'path': request_path,
+                'headers': headers_dict,
+                'actions': base_operations,
+                'packet_features': features,
+                'cpu_percent': current_stats['cpu_percent'],
+                'memory_percent': current_stats['memory_percent'],
+                'network_sent_rate': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+                'network_recv_rate': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+                'delay': process_delay,
+                'status': status,
+                'requests_per_sec': rps,
+            }
+            
+            with requests_log_lock:
+                recent_requests.append(log_entry)
+            
+            # 準備模板數據
+            template_data = {
+                'status': status,
+                'status_color': status_color,
+                'total_requests': current_count,
+                'blocked_count': current_blocked,
+                'requests_per_sec': rps,
+                'cpu_percent': current_stats['cpu_percent'],
+                'memory_percent': current_stats['memory_percent'],
+                'network_sent': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
+                'network_recv': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+                'delay': process_delay,
+                'uptime': elapsed,
+                'defense_mechanisms': defense_mechanisms,
+                'blacklist_ips': blacklist_ips,
+                'blocked_logs': blocked_logs,
+                'allowed_logs': allowed_logs,
+                'client_ip': client_ip,
+                'method': request_method,
+                'path': request_path,
+                'timestamp': log_entry['timestamp'],
+                'packet_features': features,
+                'headers': headers_dict,
+                'actions': base_operations,
+                'defense_stats': defense_stats,
+                'ip_analysis': ip_analysis,
+                'block_reasons': top_block_reasons,
+                'block_rate': (current_blocked/(current_count+current_blocked)*100 if current_count+current_blocked > 0 else 0)
+            }
+            
+            # 使用模板渲染響應
+            response = template_renderer.render_defense_dashboard(template_data)
+            
             # 回應請求
             self.send_response(200)
             self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
             
-            response = f"""
-            <html>
-            <head>
-                <title>DDoS 防禦測試伺服器</title>
-                <meta http-equiv="refresh" content="1">
-                <style>
-                    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                    body {{
-                        font-family: 'Segoe UI', Arial, sans-serif;
-                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                        color: white;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        min-height: 100vh;
-                        padding: 20px;
-                    }}
-                    .container {{
-                        background: rgba(255, 255, 255, 0.1);
-                        backdrop-filter: blur(10px);
-                        padding: 30px;
-                        border-radius: 20px;
-                        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-                        max-width: 900px;
-                        width: 100%;
-                    }}
-                    h1 {{
-                        text-align: center;
-                        font-size: 2em;
-                        margin-bottom: 20px;
-                        text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-                    }}
-                    .status-box {{
-                        background: rgba(0, 0, 0, 0.3);
-                        padding: 20px;
-                        border-radius: 15px;
-                        margin-bottom: 20px;
-                        text-align: center;
-                    }}
-                    .status {{
-                        font-size: 1.8em;
-                        font-weight: bold;
-                        color: {status_color};
-                        margin-bottom: 10px;
-                    }}
-                    .defense-status {{
-                        font-size: 1.2em;
-                        color: #4CAF50;
-                        margin-top: 10px;
-                    }}
-                    .stats-grid {{
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                        gap: 15px;
-                        margin: 20px 0;
-                    }}
-                    .stat-card {{
-                        background: rgba(0, 0, 0, 0.2);
-                        padding: 20px;
-                        border-radius: 10px;
-                        text-align: center;
-                    }}
-                    .stat-value {{
-                        font-size: 2em;
-                        font-weight: bold;
-                        color: #fff;
-                        margin-bottom: 5px;
-                    }}
-                    .stat-label {{
-                        font-size: 0.9em;
-                        color: #ddd;
-                    }}
-                    .defense-list {{
-                        background: rgba(0, 0, 0, 0.2);
-                        padding: 20px;
-                        border-radius: 10px;
-                        margin-top: 20px;
-                    }}
-                    .defense-item {{
-                        display: flex;
-                        justify-content: space-between;
-                        padding: 10px 0;
-                        border-bottom: 1px solid rgba(255,255,255,0.1);
-                    }}
-                    .defense-item:last-child {{
-                        border-bottom: none;
-                    }}
-                    .spinner {{
-                        border: 6px solid rgba(255, 255, 255, 0.3);
-                        border-top: 6px solid white;
-                        border-radius: 50%;
-                        width: 50px;
-                        height: 50px;
-                        animation: spin 1s linear infinite;
-                        margin: 15px auto;
-                        display: {('block' if delay > 0 else 'none')};
-                    }}
-                    @keyframes spin {{
-                        0% {{ transform: rotate(0deg); }}
-                        100% {{ transform: rotate(360deg); }}
-                    }}
-                    .progress-bar {{
-                        width: 100%;
-                        height: 10px;
-                        background: rgba(255, 255, 255, 0.2);
-                        border-radius: 5px;
-                        overflow: hidden;
-                        margin: 15px 0;
-                    }}
-                    .progress-fill {{
-                        height: 100%;
-                        background: {status_color};
-                        width: {min(rps/2, 100)}%;
-                        transition: width 0.3s;
-                        animation: pulse 1.5s infinite;
-                    }}
-                    @keyframes pulse {{
-                        0%, 100% {{ opacity: 1; }}
-                        50% {{ opacity: 0.6; }}
-                    }}
-                    .badge {{
-                        display: inline-block;
-                        padding: 5px 10px;
-                        border-radius: 5px;
-                        font-size: 0.85em;
-                        font-weight: bold;
-                    }}
-                    .badge-on {{ background: #4CAF50; }}
-                    .badge-off {{ background: #f44336; }}
-                    .log-section {{
-                        background: rgba(0, 0, 0, 0.2);
-                        padding: 15px;
-                        border-radius: 10px;
-                        margin-top: 20px;
-                        max-height: 300px;
-                        overflow-y: auto;
-                    }}
-                    .log-entry {{
-                        background: rgba(255, 0, 0, 0.1);
-                        padding: 10px;
-                        margin: 5px 0;
-                        border-radius: 5px;
-                        border-left: 3px solid #ff4444;
-                        font-size: 0.85em;
-                    }}
-                    .log-time {{
-                        color: #aaa;
-                        font-weight: bold;
-                    }}
-                    .log-reason {{
-                        color: #ff8888;
-                        font-weight: bold;
-                    }}
-                    .ip-analysis {{
-                        background: rgba(0, 0, 0, 0.2);
-                        padding: 15px;
-                        border-radius: 10px;
-                        margin-top: 15px;
-                    }}
-                    .analysis-item {{
-                        display: flex;
-                        justify-content: space-between;
-                        padding: 8px 0;
-                        border-bottom: 1px solid rgba(255,255,255,0.1);
-                    }}
-                    .threat-badge {{
-                        padding: 5px 10px;
-                        border-radius: 5px;
-                        font-weight: bold;
-                        font-size: 0.9em;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>🛡️ DDoS 防禦測試伺服器</h1>
-                    
-                    <div class="status-box">
-                        <div class="status">{status}</div>
-                        <div class="defense-status">防禦系統: {defense_status}</div>
-                        <div class="spinner"></div>
-                        <div class="progress-bar">
-                            <div class="progress-fill"></div>
-                        </div>
-                    </div>
-                    
-                    <div class="stats-grid">
-                        <div class="stat-card">
-                            <div class="stat-value">{current_count}</div>
-                            <div class="stat-label">✅ 成功請求</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{current_blocked}</div>
-                            <div class="stat-label">🚫 攔截請求</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{rps:.1f}</div>
-                            <div class="stat-label">⚡ 請求/秒</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{delay*1000:.0f}ms</div>
-                            <div class="stat-label">⏱️ 當前延遲</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{defense_stats['blocked_ips']}</div>
-                            <div class="stat-label">🔒 黑名單IP</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{defense_stats['total_connections']}</div>
-                            <div class="stat-label">🔗 當前連接</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-value">{defense_stats['unique_attackers']}</div>
-                            <div class="stat-label">⚠️ 攻擊來源</div>
-                        </div>
-                    </div>
-                    
-                    <div class="ip-analysis">
-                        <h3 style="margin-bottom: 10px;">📍 您的連接分析 ({client_ip})</h3>
-                        {f'''
-                        <div class="analysis-item">
-                            <span>威脅等級</span>
-                            <span class="threat-badge">{ip_analysis['threat_level']}</span>
-                        </div>
-                        <div class="analysis-item">
-                            <span>總請求數</span>
-                            <span>{ip_analysis['total_requests']}</span>
-                        </div>
-                        <div class="analysis-item">
-                            <span>被攔截</span>
-                            <span>{ip_analysis['blocked_requests']} 次</span>
-                        </div>
-                        <div class="analysis-item">
-                            <span>請求速率</span>
-                            <span>{ip_analysis['request_rate']:.1f} req/s</span>
-                        </div>
-                        <div class="analysis-item">
-                            <span>連接時長</span>
-                            <span>{ip_analysis['duration']:.0f} 秒</span>
-                        </div>
-                        ''' if ip_analysis else '<p style="color: #888;">無數據</p>'}
-                    </div>
-                    
-                    <div class="log-section">
-                        <h3 style="margin-bottom: 10px;">🚫 最近攔截記錄</h3>
-                        {(''.join([f'''
-                        <div class="log-entry">
-                            <span class="log-time">[{log['time']}]</span>
-                            <span class="log-reason">{log['reason']}</span>
-                            <br>
-                            <small>IP: {log['ip']} | {log['details']}</small>
-                        </div>
-                        ''' for log in reversed(recent_blocks)])) if recent_blocks else '<p style="color: #888; text-align: center;">暫無攔截記錄</p>'}
-                    </div>
-                    
-                    <div class="log-section" style="max-height: 150px;">
-                        <h3 style="margin-bottom: 10px;">📊 攔截原因統計</h3>
-                        {(''.join([f'''
-                        <div style="display: flex; justify-content: space-between; padding: 5px 0;">
-                            <span>{reason}</span>
-                            <span style="color: #ff8888; font-weight: bold;">{count} 次</span>
-                        </div>
-                        ''' for reason, count in top_block_reasons])) if top_block_reasons else '<p style="color: #888; text-align: center;">暫無數據</p>'}
-                    </div>
-                    
-                    <div class="defense-list">
-                        <h3 style="margin-bottom: 15px;">🛡️ 防禦機制狀態</h3>
-                        <div class="defense-item">
-                            <span>📊 速率限制 (20 req/10s)</span>
-                            <span class="badge {'badge-on' if defense_config['rate_limiting'] else 'badge-off'}">
-                                {'啟用' if defense_config['rate_limiting'] else '關閉'}
-                            </span>
-                        </div>
-                        <div class="defense-item">
-                            <span>🚫 IP 黑名單 (30秒封鎖)</span>
-                            <span class="badge {'badge-on' if defense_config['ip_blacklist'] else 'badge-off'}">
-                                {'啟用' if defense_config['ip_blacklist'] else '關閉'}
-                            </span>
-                        </div>
-                        <div class="defense-item">
-                            <span>🔗 連接數限制 (10 concurrent)</span>
-                            <span class="badge {'badge-on' if defense_config['connection_limit'] else 'badge-off'}">
-                                {'啟用' if defense_config['connection_limit'] else '關閉'}
-                            </span>
-                        </div>
-                        <div class="defense-item">
-                            <span>✅ 請求驗證 (Headers)</span>
-                            <span class="badge {'badge-on' if defense_config['request_validation'] else 'badge-off'}">
-                                {'啟用' if defense_config['request_validation'] else '關閉'}
-                            </span>
-                        </div>
-                        <div class="defense-item">
-                            <span>⏱️ 自適應延遲 (動態)</span>
-                            <span class="badge {'badge-on' if defense_config['adaptive_delay'] else 'badge-off'}">
-                                {'啟用' if defense_config['adaptive_delay'] else '關閉'}
-                            </span>
-                        </div>
-                    </div>
-                    
-                    <p style="margin-top: 20px; text-align: center; font-size: 0.9em; color: #ddd;">
-                        運行時間: {elapsed:.0f}秒 | 攔截率: {(current_blocked/(current_count+current_blocked)*100 if current_count+current_blocked > 0 else 0):.1f}%
-                        <br>
-                        <a href="/admin/clear-blacklist" style="color: #ffcc00; text-decoration: none; font-weight: bold;">
-                            🔓 清除黑名單
-                        </a>
-                    </p>
-                </div>
-            </body>
-            </html>
-            """
             try:
                 self.wfile.write(response.encode('utf-8'))
             except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
-                # 客戶端已斷開連接
                 pass
                 
         except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
@@ -699,8 +544,8 @@ class DefenseHandler(BaseHTTPRequestHandler):
     
     def log_message(self, format, *args):
         # 每100個請求輸出一次
-        if request_count % 100 == 0:
-            print(f"[{time.strftime('%H:%M:%S')}] 請求: {request_count} | 攔截: {blocked_count}")
+        # if request_count % 100 == 0:
+            # print(f"[{time.strftime('%H:%M:%S')}] 請求: {request_count} | 攔截: {blocked_count}")
         # 其他時間不輸出,避免大量日誌
         pass
 
@@ -720,6 +565,10 @@ class SilentHTTPServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 def run_server(port=8001):
+    # 啟動監控線程
+    monitor_thread = threading.Thread(target=server_monitor.performance_record_thread, daemon=True)
+    monitor_thread.start()
+    
     # 監聽所有接口,允許從不同IP訪問
     server_address = ('0.0.0.0', port)
     httpd = SilentHTTPServer(server_address, DefenseHandler)
@@ -734,16 +583,22 @@ def run_server(port=8001):
     print("\n啟用的防禦機制:")
     for defense, enabled in defense_config.items():
         status = "✅" if enabled else "❌"
-        print(f"  {status} {defense}")
-    print("\n按 Ctrl+C 停止伺服器")
+        print(f"  {defense}")
+    print("\n📊 性能監控已啟動")
+    print("按 Ctrl+C 停止伺服器")
     print("="*60 + "\n")
     
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n\n伺服器已停止")
-        print(f"總請求數: {request_count}")
-        print(f"攔截數: {blocked_count}")
+        print("\n\n⏹️  正在停止伺服器...")
+        print(f"  總請求數: {request_count}")
+        print(f"  攔截數: {blocked_count}")
+        print(f"  攔截率: {(blocked_count/(request_count+blocked_count)*100 if request_count+blocked_count > 0 else 0):.1f}%")
+        print("\n📝 正在生成最終報告...")
+        # 傳遞攔截統計資料到報告生成函數
+        server_monitor.generate_final_report(request_count, start_time, blocked_count, dict(block_reasons))
+        print("✅ 報告已保存到 performance_report.txt")
         httpd.shutdown()
 
 if __name__ == '__main__':

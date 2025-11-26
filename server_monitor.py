@@ -326,8 +326,16 @@ def update_packet_stats(method, path, headers=None):
         combo_key = f"{method}+{path_type}"
         packet_combinations[combo_key] = packet_combinations.get(combo_key, 0) + 1
 
-def generate_final_report(request_count, start_time, output_dir='.'):
-    """生成最終分析報告"""
+def generate_final_report(request_count, start_time, blocked_count=0, block_reasons=None, output_dir='.'):
+    """生成最終分析報告
+    
+    Args:
+        request_count: 允許通過的請求數量
+        start_time: 伺服器啟動時間
+        blocked_count: 被攔截的請求數量 (選用)
+        block_reasons: 攔截原因字典 {原因: 次數} (選用)
+        output_dir: 報告輸出目錄
+    """
     import os
     report_path = os.path.join(output_dir, 'performance_report.txt')
     
@@ -339,12 +347,16 @@ def generate_final_report(request_count, start_time, output_dir='.'):
             
             # 基本統計
             total_time = time.time() - start_time
+            total_all_requests = request_count + blocked_count
+            
             f.write(f"[基本統計]\n")
             f.write(f"  啟動時間: {datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"  結束時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"  總運行時間: {total_time:.2f} 秒 ({total_time/60:.2f} 分鐘)\n")
-            f.write(f"  總請求數: {request_count}\n")
-            f.write(f"  平均請求速率: {request_count/total_time:.2f} 請求/秒\n\n")
+            f.write(f"  總請求數 (含攔截): {total_all_requests}\n")
+            f.write(f"  允許通過: {request_count} ({request_count/total_all_requests*100:.1f}%)\n" if total_all_requests > 0 else f"  允許通過: {request_count}\n")
+            f.write(f"  已攔截: {blocked_count} ({blocked_count/total_all_requests*100:.1f}%)\n" if total_all_requests > 0 else f"  已攔截: {blocked_count}\n")
+            f.write(f"  平均請求速率: {total_all_requests/total_time:.2f} 請求/秒\n\n")
             
             # 封包類型統計 (總體)
             f.write(f"[封包類型統計 - 總體]\n")
@@ -379,6 +391,27 @@ def generate_final_report(request_count, start_time, output_dir='.'):
                         percentage = (count / request_count * 100) if request_count > 0 else 0
                         f.write(f"    {combo:<25} {count:<12} {percentage:>6.2f}%\n")
             f.write("\n")
+            
+            # 攔截統計 (如果有防禦系統)
+            if blocked_count > 0 or (block_reasons and len(block_reasons) > 0):
+                f.write(f"[攔截統計 - 防禦系統]\n")
+                f.write(f"  總攔截數: {blocked_count}\n")
+                if total_all_requests > 0:
+                    block_rate = (blocked_count / total_all_requests * 100)
+                    f.write(f"  攔截率: {block_rate:.1f}%\n")
+                    f.write(f"  通過率: {100 - block_rate:.1f}%\n")
+                f.write("\n")
+                
+                if block_reasons and len(block_reasons) > 0:
+                    f.write(f"  攔截原因分類:\n")
+                    f.write(f"    {'原因':<30} {'數量':<15} {'比例':<10}\n")
+                    f.write(f"    {'-'*60}\n")
+                    
+                    sorted_reasons = sorted(block_reasons.items(), key=lambda x: x[1], reverse=True)
+                    for reason, count in sorted_reasons:
+                        percentage = (count / blocked_count * 100) if blocked_count > 0 else 0
+                        f.write(f"    {reason:<30} {count:<15} {percentage:>6.1f}%\n")
+                f.write("\n")
             
             # 獨特標頭組合
             f.write(f"[獨特的封包標頭組合]\n")
