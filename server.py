@@ -706,6 +706,7 @@ def run_server(port=8000):
             start_time,
             blocked_count=0,  # 無防禦伺服器無攔截
             block_reasons=None,
+            blocked_ips=None,
             output_dir=os.path.dirname(os.path.abspath(__file__))
         )
         

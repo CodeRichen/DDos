@@ -63,6 +63,15 @@ def format_bytes(bytes_value):
         bytes_value /= 1024.0
     return f"{bytes_value:.2f} PB"
 
+def get_current_stats():
+    """獲取當前系統狀態 (供監控頁面使用)"""
+    with stats_lock:
+        return system_stats.copy()
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.2f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.2f} PB"
+
 def system_monitor_thread():
     """背景線程: 監控系統資源使用情況"""
     global system_stats
@@ -326,7 +335,7 @@ def update_packet_stats(method, path, headers=None):
         combo_key = f"{method}+{path_type}"
         packet_combinations[combo_key] = packet_combinations.get(combo_key, 0) + 1
 
-def generate_final_report(request_count, start_time, blocked_count=0, block_reasons=None, output_dir='.'):
+def generate_final_report(request_count, start_time, blocked_count=0, block_reasons=None, blocked_ips=None, output_dir='.'):
     """生成最終分析報告
     
     Args:
@@ -334,6 +343,7 @@ def generate_final_report(request_count, start_time, blocked_count=0, block_reas
         start_time: 伺服器啟動時間
         blocked_count: 被攔截的請求數量 (選用)
         block_reasons: 攔截原因字典 {原因: 次數} (選用)
+        blocked_ips: 被攔截的IP字典 {IP: 次數} (選用)
         output_dir: 報告輸出目錄
     """
     import os
@@ -357,6 +367,68 @@ def generate_final_report(request_count, start_time, blocked_count=0, block_reas
             f.write(f"  允許通過: {request_count} ({request_count/total_all_requests*100:.1f}%)\n" if total_all_requests > 0 else f"  允許通過: {request_count}\n")
             f.write(f"  已攔截: {blocked_count} ({blocked_count/total_all_requests*100:.1f}%)\n" if total_all_requests > 0 else f"  已攔截: {blocked_count}\n")
             f.write(f"  平均請求速率: {total_all_requests/total_time:.2f} 請求/秒\n\n")
+            
+            # 伺服器資源競爭數據
+            f.write(f"[伺服器資源競爭分析]\n")
+            if performance_records:
+                cpu_values = [d['cpu_percent'] for d in performance_records if 'cpu_percent' in d]
+                memory_values = [d['memory_percent'] for d in performance_records if 'memory_percent' in d]
+                network_sent_values = [d['network_sent_rate'] for d in performance_records if 'network_sent_rate' in d]
+                network_recv_values = [d['network_recv_rate'] for d in performance_records if 'network_recv_rate' in d]
+                
+                if cpu_values:
+                    avg_cpu = sum(cpu_values) / len(cpu_values)
+                    max_cpu = max(cpu_values)
+                    min_cpu = min(cpu_values)
+                    f.write(f"  CPU 使用率:\n")
+                    f.write(f"    平均: {avg_cpu:.2f}%\n")
+                    f.write(f"    最高: {max_cpu:.2f}%\n")
+                    f.write(f"    最低: {min_cpu:.2f}%\n")
+                    cpu_high_count = sum(1 for v in cpu_values if v > 80)
+                    if cpu_high_count > 0:
+                        f.write(f"    高負載 (>80%) 次數: {cpu_high_count} ({cpu_high_count/len(cpu_values)*100:.1f}%)\n")
+                
+                if memory_values:
+                    avg_mem = sum(memory_values) / len(memory_values)
+                    max_mem = max(memory_values)
+                    min_mem = min(memory_values)
+                    f.write(f"\n  記憶體使用率:\n")
+                    f.write(f"    平均: {avg_mem:.2f}%\n")
+                    f.write(f"    最高: {max_mem:.2f}%\n")
+                    f.write(f"    最低: {min_mem:.2f}%\n")
+                    mem_high_count = sum(1 for v in memory_values if v > 85)
+                    if mem_high_count > 0:
+                        f.write(f"    高負載 (>85%) 次數: {mem_high_count} ({mem_high_count/len(memory_values)*100:.1f}%)\n")
+                
+                if network_sent_values and network_recv_values:
+                    avg_sent = sum(network_sent_values) / len(network_sent_values)
+                    max_sent = max(network_sent_values)
+                    avg_recv = sum(network_recv_values) / len(network_recv_values)
+                    max_recv = max(network_recv_values)
+                    f.write(f"\n  網路流量:\n")
+                    f.write(f"    平均發送速率: {format_bytes(avg_sent)}/s\n")
+                    f.write(f"    最高發送速率: {format_bytes(max_sent)}/s\n")
+                    f.write(f"    平均接收速率: {format_bytes(avg_recv)}/s\n")
+                    f.write(f"    最高接收速率: {format_bytes(max_recv)}/s\n")
+                    f.write(f"    總發送流量: {format_bytes(sum(network_sent_values))}\n")
+                    f.write(f"    總接收流量: {format_bytes(sum(network_recv_values))}\n")
+                
+                # 資源競爭評估
+                f.write(f"\n  資源競爭評估:\n")
+                if cpu_values and memory_values:
+                    high_load_count = sum(1 for i in range(len(cpu_values)) 
+                                         if cpu_values[i] > 70 and memory_values[i] > 70)
+                    if high_load_count > 0:
+                        f.write(f"    CPU+記憶體同時高負載: {high_load_count} 次 ({high_load_count/len(cpu_values)*100:.1f}%)\n")
+                        f.write(f"    ⚠️ 偵測到明顯資源競爭\n")
+                    else:
+                        f.write(f"    ✅ 未偵測到嚴重資源競爭\n")
+                else:
+                    f.write(f"    資料不足，無法評估\n")
+            else:
+                f.write(f"  無效能監控數據\n")
+            
+            f.write(f"\n")
             
             # 封包類型統計 (總體)
             f.write(f"[封包類型統計 - 總體]\n")
@@ -411,6 +483,25 @@ def generate_final_report(request_count, start_time, blocked_count=0, block_reas
                     for reason, count in sorted_reasons:
                         percentage = (count / blocked_count * 100) if blocked_count > 0 else 0
                         f.write(f"    {reason:<30} {count:<15} {percentage:>6.1f}%\n")
+                
+                # 顯示被攔截的 IP 統計
+                if blocked_ips and len(blocked_ips) > 0:
+                    f.write(f"\n  被攔截的 IP 地址:\n")
+                    f.write(f"    共 {len(blocked_ips)} 個不同的 IP 被攔截\n\n")
+                    f.write(f"    {'IP 地址':<20} {'攔截次數':<15} {'比例':<10}\n")
+                    f.write(f"    {'-'*50}\n")
+                    
+                    sorted_ips = sorted(blocked_ips.items(), key=lambda x: x[1], reverse=True)
+                    for ip, count in sorted_ips[:20]:  # 只顯示前 20 個
+                        percentage = (count / blocked_count * 100) if blocked_count > 0 else 0
+                        f.write(f"    {ip:<20} {count:<15} {percentage:>6.1f}%\n")
+                    
+                    if len(sorted_ips) > 20:
+                        remaining = len(sorted_ips) - 20
+                        remaining_count = sum(count for ip, count in sorted_ips[20:])
+                        percentage = (remaining_count / blocked_count * 100) if blocked_count > 0 else 0
+                        f.write(f"    ... 其他 {remaining} 個 IP  {remaining_count:<15} {percentage:>6.1f}%\n")
+                
                 f.write("\n")
             
             # 獨特標頭組合

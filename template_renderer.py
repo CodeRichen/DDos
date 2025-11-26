@@ -3,6 +3,7 @@ HTML 模板渲染模組
 負責生成動態網頁內容
 """
 import os
+import server_monitor
 
 def load_template(template_name):
     """載入 HTML 模板"""
@@ -118,6 +119,7 @@ def render_defense_dashboard(data):
     template = template.replace('{{BLOCKED_REQUESTS}}', str(data.get('blocked_requests', 0)))
     template = template.replace('{{ALLOWED_REQUESTS}}', str(data.get('allowed_requests', 0)))
     template = template.replace('{{REQUESTS_PER_SEC}}', f"{data.get('requests_per_sec', 0):.1f}/s")
+    template = template.replace('{{NETWORK_SENT_RATE}}', server_monitor.format_bytes(data.get('network_sent_rate', 0)) + '/s')
     template = template.replace('{{CPU_PERCENT}}', f"{data.get('cpu_percent', 0):.1f}%")
     template = template.replace('{{MEMORY_PERCENT}}', f"{data.get('memory_percent', 0):.1f}%")
     template = template.replace('{{BLACKLIST_COUNT}}', str(data.get('blacklist_count', 0)))
@@ -163,3 +165,122 @@ def generate_fallback_defense_dashboard(data):
     </body>
     </html>
     """
+
+def render_monitor_dashboard(data):
+    """
+    渲染實時監控儀表板
+    data: 包含監控數據的字典
+        - request_rate: 請求速率
+        - avg_delay: 平均延遲 (秒)
+        - request_count: 總請求數
+        - blocked_count: 攔截數
+        - cpu_percent: CPU 使用率
+        - memory_percent: 記憶體使用率
+        - network_sent_rate: 網路發送速率 (bytes/s)
+        - network_recv_rate: 網路接收速率 (bytes/s)
+        - uptime: 運行時間 (秒)
+    """
+    template = load_template('monitor_dashboard.html')
+    if not template:
+        return generate_fallback_monitor_dashboard(data)
+    
+    request_rate = data.get('request_rate', 0)
+    avg_delay = data.get('avg_delay', 0)
+    request_count = data.get('request_count', 0)
+    blocked_count = data.get('blocked_count', 0)
+    cpu_percent = data.get('cpu_percent', 0)
+    memory_percent = data.get('memory_percent', 0)
+    network_sent_rate = data.get('network_sent_rate', 0)
+    network_recv_rate = data.get('network_recv_rate', 0)
+    uptime = data.get('uptime', 0)
+    
+    # 計算衍生數據
+    total_requests = request_count + blocked_count
+    block_rate = (blocked_count / total_requests * 100) if total_requests > 0 else 0
+    avg_delay_ms = avg_delay * 1000  # 轉換為毫秒
+    
+    # 請求速率狀態
+    if request_rate < 50:
+        rate_status_class = 'good'
+        rate_status_text = '正常'
+    elif request_rate < 150:
+        rate_status_class = 'warning'
+        rate_status_text = '繁忙'
+    else:
+        rate_status_class = 'critical'
+        rate_status_text = '高負載'
+    
+    # 延遲狀態
+    if avg_delay < 0.1:
+        delay_status_class = 'good'
+        delay_status_text = '快速'
+    elif avg_delay < 0.5:
+        delay_status_class = 'warning'
+        delay_status_text = '正常'
+    else:
+        delay_status_class = 'critical'
+        delay_status_text = '緩慢'
+    
+    # CPU 狀態
+    cpu_status_class = ''
+    if cpu_percent > 80:
+        cpu_status_class = 'danger'
+    elif cpu_percent > 50:
+        cpu_status_class = 'warning'
+    
+    # 記憶體狀態
+    memory_status_class = ''
+    if memory_percent > 85:
+        memory_status_class = 'danger'
+    elif memory_percent > 60:
+        memory_status_class = 'warning'
+    
+    # 運行時間格式化
+    uptime_str = f"{int(uptime//60)}:{int(uptime%60):02d}"
+    
+    # 替換模板變數
+    template = template.replace('{{request_rate}}', f"{request_rate:.1f}")
+    template = template.replace('{{rate_status_class}}', rate_status_class)
+    template = template.replace('{{rate_status_text}}', rate_status_text)
+    template = template.replace('{{avg_delay}}', f"{avg_delay_ms:.1f}")
+    template = template.replace('{{delay_status_class}}', delay_status_class)
+    template = template.replace('{{delay_status_text}}', delay_status_text)
+    template = template.replace('{{request_count}}', str(request_count))
+    template = template.replace('{{blocked_count}}', str(blocked_count))
+    template = template.replace('{{block_rate}}', f"{block_rate:.1f}")
+    template = template.replace('{{cpu_percent}}', f"{cpu_percent:.1f}")
+    template = template.replace('{{cpu_status_class}}', cpu_status_class)
+    template = template.replace('{{cpu_width}}', f"{min(cpu_percent, 100):.1f}")
+    template = template.replace('{{memory_percent}}', f"{memory_percent:.1f}")
+    template = template.replace('{{memory_status_class}}', memory_status_class)
+    template = template.replace('{{memory_width}}', f"{min(memory_percent, 100):.1f}")
+    template = template.replace('{{network_sent}}', f"{network_sent_rate/1024:.1f}")
+    template = template.replace('{{network_recv}}', f"{network_recv_rate/1024:.1f}")
+    template = template.replace('{{uptime}}', uptime_str)
+    
+    return template
+
+def generate_fallback_monitor_dashboard(data):
+    """生成後備的監控儀表板 HTML"""
+    return f"""
+    <html>
+    <head>
+        <title>伺服器實時監控</title>
+        <meta http-equiv="refresh" content="2">
+    </head>
+    <body style="font-family: Arial; padding: 20px; background: #2a5298; color: white;">
+        <h1>🛡️ DDoS 防禦伺服器 - 實時監控</h1>
+        <p>請求速率: {data.get('request_rate', 0):.1f} 請求/秒</p>
+        <p>平均延遲: {data.get('avg_delay', 0)*1000:.1f} ms</p>
+        <p>總請求數: {data.get('request_count', 0)}</p>
+        <p>攔截數: {data.get('blocked_count', 0)}</p>
+        <p>CPU: {data.get('cpu_percent', 0):.1f}%</p>
+        <p>記憶體: {data.get('memory_percent', 0):.1f}%</p>
+        <p>網路發送: {data.get('network_sent_rate', 0)/1024:.1f} KB/s</p>
+        <p>網路接收: {data.get('network_recv_rate', 0)/1024:.1f} KB/s</p>
+        <p><em>模板文件未找到,使用後備顯示</em></p>
+        <p><a href="/" style="color: #4ade80;">返回首頁</a></p>
+    </body>
+    </html>
+    """
+

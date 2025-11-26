@@ -275,6 +275,43 @@ class DefenseHandler(BaseHTTPRequestHandler):
             except (ValueError, OSError, ConnectionAbortedError, BrokenPipeError):
                 pass
         
+        # 監控儀表板 - 實時監控頁面
+        if request_path == '/monitor':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html; charset=utf-8')
+            self.end_headers()
+            
+            # 獲取當前系統資源狀況
+            system_stats = server_monitor.get_current_stats()
+            uptime = time.time() - start_time
+            request_rate = get_recent_request_rate()
+            
+            # 計算平均延遲
+            recent_delays = []
+            with requests_log_lock:
+                for req in list(recent_requests)[-20:]:  # 最近20個請求
+                    if 'delay' in req:
+                        recent_delays.append(req['delay'])
+            avg_delay = (sum(recent_delays) / len(recent_delays) / 1000) if recent_delays else 0  # 轉換為秒
+            
+            # 準備模板數據
+            monitor_data = {
+                'request_rate': request_rate,
+                'avg_delay': avg_delay,
+                'request_count': request_count,
+                'blocked_count': blocked_count,
+                'cpu_percent': system_stats['cpu_percent'],
+                'memory_percent': system_stats['memory_percent'],
+                'network_sent_rate': system_stats['network_sent_rate'],
+                'network_recv_rate': system_stats['network_recv_rate'],
+                'uptime': uptime
+            }
+            
+            # 使用模板渲染
+            monitor_html = template_renderer.render_monitor_dashboard(monitor_data)
+            self.wfile.write(monitor_html.encode('utf-8'))
+            return
+        
         # 管理功能 - 清除黑名單
         if request_path == '/admin/clear-blacklist':
             cleared = defense_system.clear_blacklist()
@@ -454,14 +491,6 @@ class DefenseHandler(BaseHTTPRequestHandler):
                     f"[{log['time']}] {log['reason']} - IP: {log['ip']} | {log['details']}"
                 )
             
-            # 生成允許日誌 (最近成功的請求)
-            allowed_logs = []
-            with requests_log_lock:
-                for log in list(recent_requests)[-10:]:
-                    allowed_logs.append(
-                        f"#{log.get('request_id', '?')} | {log.get('timestamp', '?')} | {log.get('client_ip', '?')} | {log.get('method', '?')} {log.get('path', '?')}"
-                    )
-            
             # 計算處理時間
             process_delay = int((time.time() - start_request_time) * 1000)
             
@@ -484,24 +513,35 @@ class DefenseHandler(BaseHTTPRequestHandler):
                 'requests_per_sec': rps,
             }
             
+            # 先添加當前請求到記錄中
             with requests_log_lock:
                 recent_requests.append(log_entry)
+            
+            # 生成允許日誌 (最近成功的請求,包含當前這個)
+            allowed_logs = []
+            with requests_log_lock:
+                for log in list(recent_requests)[-10:]:
+                    allowed_logs.append(
+                        f"#{log.get('request_id', '?')} | {log.get('timestamp', '?')} | {log.get('client_ip', '?')} | {log.get('method', '?')} {log.get('path', '?')}"
+                    )
             
             # 準備模板數據
             template_data = {
                 'status': status,
                 'status_color': status_color,
-                'total_requests': current_count,
-                'blocked_count': current_blocked,
+                'total_requests': current_count + current_blocked,
+                'allowed_requests': current_count,
+                'blocked_requests': current_blocked,
                 'requests_per_sec': rps,
                 'cpu_percent': current_stats['cpu_percent'],
                 'memory_percent': current_stats['memory_percent'],
-                'network_sent': server_monitor.format_bytes(current_stats['network_sent_rate']) + '/s',
-                'network_recv': server_monitor.format_bytes(current_stats['network_recv_rate']) + '/s',
+                'network_sent_rate': current_stats['network_sent_rate'],
+                'network_recv_rate': current_stats['network_recv_rate'],
                 'delay': process_delay,
                 'uptime': elapsed,
                 'defense_mechanisms': defense_mechanisms,
                 'blacklist_ips': blacklist_ips,
+                'blacklist_count': len(defense_system.ip_blocked),
                 'blocked_logs': blocked_logs,
                 'allowed_logs': allowed_logs,
                 'client_ip': client_ip,
@@ -534,6 +574,7 @@ class DefenseHandler(BaseHTTPRequestHandler):
             # 連接已中斷,忽略錯誤
             pass
         finally:
+            # 減少連接計數
             defense_system.decrement_connection(client_ip)
     
     def do_POST(self):
@@ -565,9 +606,11 @@ class SilentHTTPServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 def run_server(port=8001):
-    # 啟動監控線程
-    monitor_thread = threading.Thread(target=server_monitor.performance_record_thread, daemon=True)
-    monitor_thread.start()
+    # 啟動所有監控線程 (系統資源監控 + 性能記錄)
+    def get_request_count():
+        return request_count
+    
+    server_monitor.start_monitoring(get_request_count, start_time)
     
     # 監聽所有接口,允許從不同IP訪問
     server_address = ('0.0.0.0', port)
@@ -596,8 +639,23 @@ def run_server(port=8001):
         print(f"  攔截數: {blocked_count}")
         print(f"  攔截率: {(blocked_count/(request_count+blocked_count)*100 if request_count+blocked_count > 0 else 0):.1f}%")
         print("\n📝 正在生成最終報告...")
+        
+        # 收集被攔截的所有 IP (從 block_logs 中統計)
+        blocked_ips = {}
+        for log in block_logs:
+            ip = log['ip']
+            if ip not in blocked_ips:
+                blocked_ips[ip] = 0
+            blocked_ips[ip] += 1
+        
         # 傳遞攔截統計資料到報告生成函數
-        server_monitor.generate_final_report(request_count, start_time, blocked_count, dict(block_reasons))
+        server_monitor.generate_final_report(
+            request_count, 
+            start_time, 
+            blocked_count, 
+            dict(block_reasons),
+            blocked_ips
+        )
         print("✅ 報告已保存到 performance_report.txt")
         httpd.shutdown()
 
