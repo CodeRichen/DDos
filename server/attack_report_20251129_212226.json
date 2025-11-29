@@ -1,0 +1,45 @@
+{
+  "uptime": 59.1552996635437,
+  "stats": {
+    "tcp_connections": 4,
+    "tcp_syn": 0,
+    "tcp_rst": 0,
+    "udp_packets": 0,
+    "icmp_packets": 0,
+    "http_requests": 3,
+    "dns_queries": 0
+  },
+  "attack_types": {
+    "HTTP GET Request": 3,
+    "Slowloris Attack": 1
+  },
+  "top_attackers": {
+    "127.0.0.1": 4
+  },
+  "recent_attacks": [
+    {
+      "timestamp": "2025-11-29 21:21:45.336",
+      "type": "HTTP GET Request",
+      "source": "127.0.0.1",
+      "details": "收到 HTTP 請求，大小 608 bytes"
+    },
+    {
+      "timestamp": "2025-11-29 21:21:46.921",
+      "type": "Slowloris Attack",
+      "source": "127.0.0.1",
+      "details": "連接建立後長時間不發送數據，疑似 Slowloris"
+    },
+    {
+      "timestamp": "2025-11-29 21:21:50.333",
+      "type": "HTTP GET Request",
+      "source": "127.0.0.1",
+      "details": "收到 HTTP 請求，大小 728 bytes"
+    },
+    {
+      "timestamp": "2025-11-29 21:21:50.462",
+      "type": "HTTP GET Request",
+      "source": "127.0.0.1",
+      "details": "收到 HTTP 請求，大小 608 bytes"
+    }
+  ]
+}

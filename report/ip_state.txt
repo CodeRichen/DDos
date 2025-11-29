@@ -1,0 +1,52 @@
+目標 URL: https://elearningv4.nuk.edu.tw/
+主機: elearningv4.nuk.edu.tw
+端口: 443
+協議: HTTPS
+
+🌐 目標解析: elearningv4.nuk.edu.tw → 140.127.233.24
+
+✅ 開放的 TCP 端口: 1 個
+--------------------------------------------------------------------------------
+  端口   443 - HTTPS
+           Banner: HTTP/1.1 400 Bad Request Server: nginx Date: Sat, ...
+
+🌐 HTTP/HTTPS 服務:
+--------------------------------------------------------------------------------
+  HTTP  http://140.127.233.24:443
+        狀態碼: 400
+        伺服器: nginx
+  HTTPS https://140.127.233.24:443
+        狀態碼: 200
+        伺服器: nginx
+
+📍 端口 443 (HTTPS)
+   可行的攻擊方式:
+   ✅ HTTP Request Flood (GET/POST)
+   ✅ Slowloris 攻擊
+   ✅ HTTP POST Slow 攻擊
+   ⚠️  可能支援 HTTPS (SSL DDoS)
+
+📍 端口 80 (HTTP)
+   可行的攻擊方式:
+   ✅ HTTP Request Flood (GET/POST)
+   ✅ Slowloris 攻擊
+   ✅ HTTP POST Slow 攻擊
+   ⚠️  可能支援 HTTPS (SSL DDoS)
+
+🌐 HTTP/HTTPS 服務:
+--------------------------------------------------------------------------------
+  HTTP  http://140.127.233.24:80
+        狀態碼: 200
+        伺服器: nginx
+  HTTP  http://140.127.233.24:443
+        狀態碼: 400
+        伺服器: nginx
+  HTTPS https://140.127.233.24:443
+        狀態碼: 200
+        伺服器: nginx
+
+
+
+
+course.nuk.edu.tw → 140.127.234.20
+https://course.nuk.edu.tw/Sel/login.asp
