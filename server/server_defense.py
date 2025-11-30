@@ -1,9 +1,12 @@
+# -*- coding: utf-8 -*-
 """
 進階防禦伺服器 - 包含多種 DDoS 防禦機制
 僅用於教育目的和本地測試
+現已支持同時監聽 TCP (HTTP) 和 UDP 流量
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
-from socketserver import ThreadingMixIn
+from socketserver import ThreadingMixIn, UDPServer, BaseRequestHandler
+import socket
 import time
 import threading
 from collections import defaultdict, deque
@@ -28,25 +31,29 @@ requests_log_lock = threading.Lock()
 request_timestamps = deque(maxlen=1000)
 timestamps_lock = threading.Lock()
 
+# 用於計算允許通過的請求速率的時間窗口（只計算通過防禦的請求）
+allowed_timestamps = deque(maxlen=1000)
+allowed_timestamps_lock = threading.Lock()
+
 def get_request_count():
     """獲取當前請求總數"""
     with request_lock:
         return request_count
 
 def get_recent_request_rate():
-    """計算最近 10 秒的請求速率"""
+    """計算最近 10 秒的請求速率（只計算允許通過的請求）"""
     current_time = time.time()
     time_window = 10.0
     
-    with timestamps_lock:
-        while request_timestamps and current_time - request_timestamps[0] > time_window:
-            request_timestamps.popleft()
+    with allowed_timestamps_lock:
+        while allowed_timestamps and current_time - allowed_timestamps[0] > time_window:
+            allowed_timestamps.popleft()
         
-        count = len(request_timestamps)
+        count = len(allowed_timestamps)
         if count == 0:
             return 0.0
         
-        actual_window = current_time - request_timestamps[0] if count > 0 else time_window
+        actual_window = current_time - allowed_timestamps[0] if count > 0 else time_window
         return count / actual_window if actual_window > 0 else 0.0
 
 # 攔截日誌
@@ -63,10 +70,105 @@ defense_config = {
     'adaptive_delay': True,      # 自適應延遲
 }
 
+# UDP 洪泛處理器
+class UDPFloodHandler(BaseRequestHandler):
+    """處理 UDP 洪泛攻擊 - 應用防禦機制"""
+    packet_count = 0
+    count_lock = threading.Lock()
+    defense_system = None  # 將在 run_server 中設置
+    last_log_time = time.time()
+    
+    def handle(self):
+        global request_count, blocked_count
+        
+        try:
+            data = self.request[0]  # UDP 數據包
+            client_ip = self.client_address[0]
+            
+            # 增加計數
+            with self.count_lock:
+                UDPFloodHandler.packet_count += 1
+                packet_num = UDPFloodHandler.packet_count
+                # 每次都檢查是否需要打印（減少鎖爭用）
+                should_log = (packet_num % 100 == 0)
+            
+            # 增加全局請求計數
+            with request_lock:
+                request_count += 1
+            
+            # 應用防禦邏輯
+            is_blocked = False
+            block_reason = None
+            
+            # 調試：檢查防禦系統是否被初始化
+            if not UDPFloodHandler.defense_system:
+                # 防禦系統未初始化，記錄警告
+                try:
+                    with open('server_log.txt', 'a', encoding='utf-8') as f:
+                        f.write(f"[警告] UDP 處理器中防禦系統為 None (包 #{packet_num})\n")
+                except:
+                    pass
+            
+            if UDPFloodHandler.defense_system:
+                # 檢查是否應該攔截
+                try:
+                    should_block, reason = UDPFloodHandler.defense_system.check_request(
+                        client_ip, 
+                        'UDP', 
+                        '/udp_flood'
+                    )
+                    
+                    if should_block:
+                        is_blocked = True
+                        block_reason = reason
+                        with request_lock:
+                            blocked_count += 1
+                        
+                        # 記錄攔截到防禦系統
+                        UDPFloodHandler.defense_system.log_block(
+                            client_ip,
+                            reason,
+                            {'packet_size': len(data), 'protocol': 'UDP'}
+                        )
+                    else:
+                        # 記錄允許通過的請求時間戳
+                        with allowed_timestamps_lock:
+                            allowed_timestamps.append(time.time())
+                except Exception as defense_error:
+                    # 防禦檢查出錯，記錄錯誤信息（用於調試）
+                    try:
+                        with open('server_log.txt', 'a', encoding='utf-8') as f:
+                            f.write(f"[錯誤] UDP 防禦檢查失敗: {str(defense_error)[:100]}\n")
+                    except:
+                        pass
+            
+            # 定期記錄統計（避免頻繁 I/O）
+            if should_log:
+                try:
+                    with open('server_log.txt', 'a', encoding='utf-8') as f:
+                        status = "🚫 攔截" if is_blocked else "✅ 通過"
+                        f.write(f"[UDP] {time.strftime('%Y-%m-%d %H:%M:%S')} | "
+                                f"#{packet_num:,} packets | "
+                                f"From {client_ip} | "
+                                f"Size: {len(data)} bytes | "
+                                f"{status}\n")
+                except Exception as log_error:
+                    pass
+                
+        except Exception as e:
+            # 靜默忽略錯誤，不打印以避免輸出過多
+            pass
+
+# UDP 伺服器
+class ThreadedUDPServer(UDPServer, ThreadingMixIn):
+    """支持多線程的 UDP 伺服器"""
+    daemon_threads = True
+    allow_reuse_address = True
+
 # 防禦狀態
 class DefenseSystem:
     def __init__(self):
-        self.ip_requests = defaultdict(lambda: deque(maxlen=100))  # IP請求記錄
+        self.ip_requests = defaultdict(lambda: deque())  # IP請求記錄
         self.ip_blocked = {}  # IP黑名單 {ip: until_time}
         self.connection_count = defaultdict(int)  # 當前連接數
         self.ip_info = defaultdict(lambda: {
@@ -142,12 +244,13 @@ class DefenseSystem:
         return True
     
     def calculate_adaptive_delay(self):
+        global request_count, blocked_count
         """自適應延遲: 根據當前負載動態調整"""
         if not defense_config['adaptive_delay']:
             return 0
             
         elapsed = time.time() - start_time
-        rps = request_count / elapsed if elapsed > 0 else 0
+        rps = (request_count-blocked_count) / elapsed if elapsed > 0 else 0
         
         if rps > 200:
             return 1.0  # 高負載: 1秒延遲
@@ -235,6 +338,67 @@ class DefenseSystem:
             cleared_count = len(self.ip_blocked)
             self.ip_blocked.clear()
             return cleared_count
+    
+    def check_request(self, ip, protocol='HTTP', path='/', headers=None):
+        """
+        統一的防禦檢查方法
+        返回 (should_block, reason) - should_block 為 True 時表示應該攔截
+        """
+        if headers is None:
+            headers = {}
+        
+        # 1. 檢查 IP 黑名單
+        if self.is_ip_blocked(ip):
+            return True, "IP 黑名單"
+        
+        # 2. 檢查速率限制
+        # UDP 洪泛攻擊防禦：更嚴格的限制
+        if protocol == 'UDP':
+            # UDP 限制更嚴格：10秒內最多 100 個包（正常客戶端不會發這麼多）
+            max_requests = 100
+            time_window = 10
+        else:
+            # HTTP 請求：10秒內最多 20 個請求
+            max_requests = 20
+            time_window = 10
+        
+        # 先檢查是否超限
+        with self.lock:
+            now = time.time()
+            self.ip_requests[ip].append(now)
+            
+            # 清理舊記錄
+            while self.ip_requests[ip] and self.ip_requests[ip][0] < now - time_window:
+                self.ip_requests[ip].popleft()
+            
+            request_count_for_ip = len(self.ip_requests[ip])
+        
+        if request_count_for_ip > max_requests:
+            # 加入黑名單 30 秒
+            with self.lock:
+                self.ip_blocked[ip] = now + 30
+            
+            # 調試日誌：記錄攔截事件
+            try:
+                with open('server_log.txt', 'a', encoding='utf-8') as f:
+                    f.write(f"[防禦] UDP 速率限制觸發: {ip} 在 10 秒內有 {request_count_for_ip} 個包\n")
+            except:
+                pass
+            
+            return True, "速率限制"
+        
+        # 3. 檢查連接限制
+        if protocol == 'HTTP' and not self.check_connection_limit(ip):
+            return True, "連接數限制"
+        
+        # 4. 請求驗證（HTTP 專用）
+        if protocol == 'HTTP' and not self.validate_request(headers):
+            return True, "請求驗證失敗"
+        
+        # 記錄請求
+        self.log_request(ip, path, headers.get('User-Agent', 'Unknown'))
+        
+        return False, "正常"
     
     def unblock_ip(self, ip):
         """解除特定IP的封鎖"""
@@ -354,6 +518,10 @@ class DefenseHandler(BaseHTTPRequestHandler):
         # 記錄請求信息
         defense_system.log_request(client_ip, request_path, user_agent)
         
+        # 立即增加全局請求計數（在防禦檢查之前，因為這是收到的所有請求）
+        with request_lock:
+            request_count += 1
+        
         try:
             # 1. 檢查 IP 黑名單
             if defense_system.is_ip_blocked(client_ip):
@@ -408,14 +576,10 @@ class DefenseHandler(BaseHTTPRequestHandler):
             if delay > 0:
                 time.sleep(delay)
             
-            # 更新統計和時間戳
-            with request_lock:
-                request_count += 1
-                current_count = request_count
-                current_blocked = blocked_count
-            
-            with timestamps_lock:
-                request_timestamps.append(time.time())
+            # 記錄允許通過的請求時間戳（用於計算允許通過的請求速率）
+            with allowed_timestamps_lock:
+                allowed_timestamps.append(time.time())
+
             
             # 收集 HTTP 標頭
             headers_dict = dict(self.headers.items())
@@ -487,9 +651,10 @@ class DefenseHandler(BaseHTTPRequestHandler):
             # 生成攔截日誌
             blocked_logs = []
             for log in reversed(recent_blocks):
-                blocked_logs.append(
-                    f"[{log['time']}] {log['reason']} - IP: {log['ip']} | {log['details']}"
-                )
+                if 'time' in log:  # 確保 log 有 'time' 鍵
+                    blocked_logs.append(
+                        f"[{log['time']}] {log['reason']} - IP: {log['ip']} | {log['details']}"
+                    )
             
             # 計算處理時間
             process_delay = int((time.time() - start_request_time) * 1000)
@@ -497,7 +662,7 @@ class DefenseHandler(BaseHTTPRequestHandler):
             # 構建日誌條目
             log_entry = {
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'request_id': current_count,
+                'request_id': request_count,
                 'client_ip': client_ip,
                 'method': request_method,
                 'path': request_path,
@@ -529,9 +694,9 @@ class DefenseHandler(BaseHTTPRequestHandler):
             template_data = {
                 'status': status,
                 'status_color': status_color,
-                'total_requests': current_count + current_blocked,
-                'allowed_requests': current_count,
-                'blocked_requests': current_blocked,
+                'total_requests': request_count,
+                'allowed_requests': request_count - blocked_count,
+                'blocked_requests': blocked_count,
                 'requests_per_sec': rps,
                 'cpu_percent': current_stats['cpu_percent'],
                 'memory_percent': current_stats['memory_percent'],
@@ -554,7 +719,7 @@ class DefenseHandler(BaseHTTPRequestHandler):
                 'defense_stats': defense_stats,
                 'ip_analysis': ip_analysis,
                 'block_reasons': top_block_reasons,
-                'block_rate': (current_blocked/(current_count+current_blocked)*100 if current_count+current_blocked > 0 else 0)
+                'block_rate': (blocked_count/request_count*100 if request_count > 0 else 0)
             }
             
             # 使用模板渲染響應
@@ -606,9 +771,11 @@ class SilentHTTPServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 def run_server(port=8001):
+    # 使用全局防禦系統實例
+    global defense_system
+    global request_count, blocked_count
+    global start_time
     # 啟動所有監控線程 (系統資源監控 + 性能記錄)
-    def get_request_count():
-        return request_count
     
     server_monitor.start_monitoring(get_request_count, start_time)
     
@@ -616,29 +783,89 @@ def run_server(port=8001):
     server_address = ('0.0.0.0', port)
     httpd = SilentHTTPServer(server_address, DefenseHandler)
     
+    # UDP 監聽在相同端口（TCP 和 UDP 可以使用相同端口）
+    udp_port = port
+    
     print("="*60)
-    print("🛡️  DDoS 防禦測試伺服器")
+    print("[防禦] DDoS 防禦測試伺服器")
     print("="*60)
     print(f"伺服器啟動於:")
-    print(f"  - 端口: {port}")
-    print(f"  - 本地: http://127.0.0.1:{port}")
-    print(f"  - 局域網: http://0.0.0.0:{port}")
+    print(f"  - TCP (HTTP) 端口: {port}")
+    print(f"  - UDP 端口: {udp_port} (UDP Flood 防禦)")
+    print(f"  - 本地 HTTP: http://127.0.0.1:{port}")
+    print(f"  - 局域網 HTTP: http://0.0.0.0:{port}")
     print("\n啟用的防禦機制:")
     for defense, enabled in defense_config.items():
         status = "✅" if enabled else "❌"
         print(f"  {defense}")
-    print("\n📊 性能監控已啟動")
+    print("\n[監控] 性能監控已啟動")
     print("按 Ctrl+C 停止伺服器")
     print("="*60 + "\n")
+    
+    # 初始化日誌文件
+    try:
+        import os
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server_log.txt')
+        with open(log_path, 'w', encoding='utf-8') as f:
+            from datetime import datetime
+            f.write(f"{'='*80}\n")
+            f.write(f"DDoS 防禦伺服器日誌 (TCP + UDP 防禦)\n")
+            f.write(f"啟動時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"TCP 端口: {port}\n")
+            f.write(f"UDP 端口: {udp_port}\n")
+            f.write(f"日誌位置: {log_path}\n")
+            f.write(f"{'='*80}\n")
+    except Exception as e:
+        pass
+    
+    # 在單獨的線程中啟動 UDP 伺服器並應用防禦
+    udp_server = None
+    try:
+        # 設置防禦系統到 UDP 處理器
+        print(f"[調試] 防禦系統物件: {defense_system}")
+        print(f"[調試] 設置防禦系統到 UDP 處理器...")
+        UDPFloodHandler.defense_system = defense_system
+        print(f"[調試] UDP 處理器防禦系統: {UDPFloodHandler.defense_system}")
+        
+        udp_server = ThreadedUDPServer(('0.0.0.0', udp_port), UDPFloodHandler)
+        udp_thread = threading.Thread(target=udp_server.serve_forever, daemon=True)
+        udp_thread.start()
+        print(f"[系統] UDP 監聽線程已啟動 (端口 {udp_port})\n")
+    except Exception as e:
+        print(f"[警告] 無法啟動 UDP 伺服器: {e}\n")
+        import traceback
+        traceback.print_exc()
+    
+    # 啟動實時統計輸出線程
+    def stats_printer():
+        """每 2 秒輸出一次統計信息"""
+        while True:
+            time.sleep(2)
+            try:
+                with request_lock:
+                    req = request_count
+                    blk = blocked_count
+                    passed = req - blk
+                print(f"[統計] 總請求: {req:>8} | 允許通過: {passed:>8} | 攔截: {blk:>8} | "
+                      f"攔截率: {(blk/req*100 if req > 0 else 0):>5.1f}%")
+            except:
+                pass
+    
+    stats_thread = threading.Thread(target=stats_printer, daemon=True)
+    stats_thread.start()
     
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n\n⏹️  正在停止伺服器...")
+        print("\n\n[停止] 正在停止伺服器...")
+        if udp_server:
+            udp_server.shutdown()
+        passed = request_count - blocked_count
         print(f"  總請求數: {request_count}")
+        print(f"  允許通過: {passed}")
         print(f"  攔截數: {blocked_count}")
-        print(f"  攔截率: {(blocked_count/(request_count+blocked_count)*100 if request_count+blocked_count > 0 else 0):.1f}%")
-        print("\n📝 正在生成最終報告...")
+        print(f"  攔截率: {(blocked_count/request_count*100 if request_count > 0 else 0):.1f}%")
+        print("\n[報告] 正在生成最終報告...")
         
         # 收集被攔截的所有 IP (從 block_logs 中統計)
         blocked_ips = {}
@@ -656,14 +883,14 @@ def run_server(port=8001):
             dict(block_reasons),
             blocked_ips
         )
-        print("✅ 報告已保存到 performance_report.txt")
+        print("[完成] 報告已保存到 performance_report.txt")
         httpd.shutdown()
 
 if __name__ == '__main__':
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] == '--no-defense':
-        print("⚠️  警告: 關閉所有防禦機制!")
+        print("[警告] 警告: 關閉所有防禦機制!")
         for key in defense_config:
             defense_config[key] = False
     
