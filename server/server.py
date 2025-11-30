@@ -1,9 +1,11 @@
 """
 簡單的HTTP伺服器用於DDoS測試
 僅用於教育目的和本地測試
+現已支持同時監聽 TCP (HTTP) 和 UDP 流量
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
-from socketserver import ThreadingMixIn
+from socketserver import ThreadingMixIn, UDPServer, BaseRequestHandler
+import socket
 import time
 import threading
 from collections import deque
@@ -636,6 +638,44 @@ class SimpleHandler(BaseHTTPRequestHandler):
         # 完全禁用終端日誌輸出,所有資訊記錄到文件
         pass
 
+class UDPFloodHandler(BaseRequestHandler):
+    """UDP Flood 攻擊處理器 - 記錄並統計 UDP 數據包"""
+    def handle(self):
+        global request_count
+        
+        try:
+            data = self.request[0]  # 數據內容
+            client_ip = self.client_address[0]
+            
+            with request_lock:
+                request_count += 1
+                current_count = request_count
+            
+            with timestamps_lock:
+                request_timestamps.append(time.time())
+            
+            # 記錄 UDP 數據包統計
+            log_entry = {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                'request_id': current_count,
+                'client_ip': client_ip,
+                'protocol': 'UDP',
+                'data_size': len(data),
+                'status': 'UDP 數據包已接收'
+            }
+            
+            # 簡化的 UDP 日誌記錄
+            try:
+                log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server_log.txt')
+                if current_count % 1000 == 0:  # 每 1000 個包記錄一次
+                    with open(log_path, 'a', encoding='utf-8') as f:
+                        f.write(f"\n[UDP] #{current_count} | {log_entry['timestamp']} | {client_ip} | {len(data)} bytes\n")
+            except:
+                pass
+                
+        except Exception as e:
+            pass
+
 class SilentHTTPServer(ThreadingHTTPServer):
     """自定義 ThreadingHTTPServer,支持多線程並忽略連接錯誤"""
     def handle_error(self, request, client_address):
@@ -651,9 +691,18 @@ class SilentHTTPServer(ThreadingHTTPServer):
         # 其他錯誤才顯示
         super().handle_error(request, client_address)
 
+class ThreadedUDPServer(UDPServer, ThreadingMixIn):
+    """支持多線程的 UDP 伺服器"""
+    pass
+
 def run_server(port=8000):
+    # 啟動 HTTP 伺服器
     server_address = ('0.0.0.0', port)
     httpd = SilentHTTPServer(server_address, SimpleHandler)
+    
+    # 啟動 UDP 伺服器
+    udp_address = ('0.0.0.0', port)
+    udp_server = ThreadedUDPServer(udp_address, UDPFloodHandler)
     
     # 配置線程參數以提高並發處理能力
     httpd.daemon_threads = True  # 守護線程,主程序結束時自動結束
@@ -666,15 +715,17 @@ def run_server(port=8000):
     print("⚠️  無防禦測試伺服器 (多線程版 + 詳細報告)")
     print("="*60)
     print(f"伺服器啟動於:")
-    print(f"  - 端口: {port}")
+    print(f"  - TCP 端口: {port} (HTTP)")
+    print(f"  - UDP 端口: {port} (UDP Flood 接收)")
     print(f"  - 本地: http://127.0.0.1:{port}")
     print(f"  - 局域網: http://0.0.0.0:{port}")
     print(f"  - 防禦: ❌ 無任何防禦機制")
-    print(f"  - 並發: ✅ 支持多線程處理")
+    print(f"  - 並發: ✅ 支持多線程處理 (TCP + UDP)")
     print(f"  - 隊列: {httpd.request_queue_size} 個請求")
     print(f"  - 報告: ✅ 網頁顯示 + 文件記錄 (server_log.txt)")
     print(f"  - 監控: ✅ CPU + 記憶體 + 網路速率")
     print(f"  - 統計: ✅ 每5秒性能記錄 + 封包類型統計")
+    print(f"  - UDP: ✅ 監聽 UDP 數據包")
     print("按 Ctrl+C 停止伺服器並生成完整報告")
     print("="*60 + "\n")
     
@@ -684,20 +735,27 @@ def run_server(port=8000):
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server_log.txt')
         with open(log_path, 'w', encoding='utf-8') as f:
             f.write(f"{'='*80}\n")
-            f.write(f"DDoS 測試伺服器日誌\n")
+            f.write(f"DDoS 測試伺服器日誌 (支持 TCP + UDP)\n")
             f.write(f"啟動時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"端口: {port}\n")
+            f.write(f"TCP 端口: {port}\n")
+            f.write(f"UDP 端口: {port}\n")
             f.write(f"日誌位置: {log_path}\n")
             f.write(f"{'='*80}\n")
         print(f"[系統] 已初始化日誌文件: {log_path}\n")
     except Exception as e:
         print(f"[警告] 無法創建日誌文件: {e}\n")
     
+    # 在單獨的線程中啟動 UDP 伺服器
+    udp_thread = threading.Thread(target=udp_server.serve_forever, daemon=True)
+    udp_thread.start()
+    print(f"[系統] UDP 監聽線程已啟動\n")
+    
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n\n[系統] 正在關閉伺服器...")
         httpd.shutdown()
+        udp_server.shutdown()
         
         # 生成最終報告
         print("[系統] 正在生成性能分析報告...")
