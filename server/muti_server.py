@@ -23,7 +23,6 @@ TCP_PORT = 8000      # TCP (HTTP) 端口
 UDP_PORT = 9001      # UDP 端口 (避開 8001 常見衝突)
 DNS_PORT = 53        # DNS 端口 (需要 root)
 MONITOR_ICMP = True  # 是否監控 ICMP (需要 root)
-LOG_FILE = "attack_log.txt"
 # ==================
 
 class AttackMonitor:
@@ -57,23 +56,12 @@ class AttackMonitor:
                 'details': details
             }
             self.recent_attacks.append(event)
-            
-            # 寫入日誌
-            self.write_log(event)
     
     def increment_stat(self, stat_name):
         """增加統計計數"""
         with self.lock:
             if stat_name in self.stats:
                 self.stats[stat_name] += 1
-    
-    def write_log(self, event):
-        """寫入日誌文件"""
-        try:
-            with open(LOG_FILE, 'a', encoding='utf-8') as f:
-                f.write(f"{event['timestamp']} | {event['type']:20s} | {event['source']:15s} | {event['details']}\n")
-        except:
-            pass
     
     def get_summary(self):
         """獲取統計摘要"""
@@ -445,17 +433,6 @@ def main():
     print("  - ICMP 封包 (Ping Flood)")
     print("="*80 + "\n")
     
-    # 初始化日誌文件
-    try:
-        with open(LOG_FILE, 'w', encoding='utf-8') as f:
-            f.write(f"{'='*80}\n")
-            f.write(f"多協議 DDoS 監測伺服器日誌\n")
-            f.write(f"啟動時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"{'='*80}\n\n")
-        print(f"📝 日誌文件: {LOG_FILE}\n")
-    except Exception as e:
-        print(f"⚠️  無法創建日誌文件: {e}\n")
-    
     threads = []
     
     # 啟動 TCP 監聽器
@@ -513,17 +490,6 @@ def main():
         # 生成最終報告
         monitor.print_summary()
         
-        # 保存詳細報告
-        summary = monitor.get_summary()
-        report_file = f"attack_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        try:
-            with open(report_file, 'w', encoding='utf-8') as f:
-                json.dump(summary, f, ensure_ascii=False, indent=2)
-            print(f"\n📊 詳細報告已保存至: {report_file}")
-        except Exception as e:
-            print(f"⚠️  無法保存報告: {e}")
-        
-        print(f"📝 日誌文件: {LOG_FILE}")
         print("\n✅ 伺服器已關閉\n")
 
 if __name__ == '__main__':
