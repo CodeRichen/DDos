@@ -175,8 +175,7 @@ def progressive_test(target_url, attack_method, defense_enabled):
     attacker = ProgressiveAttack(target_url, attack_method)
     
     # 漸進式增加線程: 10~10000
-    thread_steps = [10, 20, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000,
-                    1200, 1400, 1600, 1800, 2000, 2500, 3000, 4000, 5000, 6000, 8000, 10000]
+    thread_steps = [10, 100, 500, 1000, 1500, 2000, 5000, 10000]
     results = []
     
     for num_threads in thread_steps:
@@ -184,9 +183,9 @@ def progressive_test(target_url, attack_method, defense_enabled):
         results.append(result)
         is_severe = print_result(result)
         
-        # 只有真正的性能卡頓才停止測試(延遲 > 5秒)
+        # 只有真正的性能卡頓才停止測試(延遲 > 15秒)
         # 如果只是防禦攔截,繼續測試
-        if is_severe and result['avg_response_time'] > 5.0:
+        if is_severe and result['avg_response_time'] > 15.0:
             print(f"\n⚠️  伺服器效能嚴重下降,停止增加線程")
             break
         

@@ -11,10 +11,16 @@ import struct
 from collections import Counter, deque
 from datetime import datetime
 import json
+import platform
+
+try:
+    import ctypes
+except ImportError:
+    ctypes = None
 
 # ===== 配置區 =====
 TCP_PORT = 8000      # TCP (HTTP) 端口
-UDP_PORT = 8001      # UDP 端口
+UDP_PORT = 9001      # UDP 端口 (避開 8001 常見衝突)
 DNS_PORT = 53        # DNS 端口 (需要 root)
 MONITOR_ICMP = True  # 是否監控 ICMP (需要 root)
 LOG_FILE = "attack_log.txt"
@@ -218,50 +224,72 @@ class UDPListener:
     @staticmethod
     def start(port):
         """啟動 UDP 監聽"""
-        try:
-            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_socket.bind(('0.0.0.0', port))
-            
-            print(f"✅ UDP 監聽器啟動於端口 {port}")
-            
-            while True:
-                try:
-                    data, addr = udp_socket.recvfrom(65535)
-                    monitor.increment_stat('udp_packets')
-                    
-                    source_ip = addr[0]
-                    
-                    # 檢查是否是 DNS 查詢
-                    if len(data) > 12 and port == 53:
-                        monitor.increment_stat('dns_queries')
-                        monitor.record_attack(
-                            "DNS Query",
-                            source_ip,
-                            f"DNS 查詢，大小 {len(data)} bytes"
-                        )
-                    else:
-                        # 普通 UDP 封包
-                        monitor.record_attack(
-                            "UDP Packet",
-                            source_ip,
-                            f"UDP 封包，大小 {len(data)} bytes"
-                        )
-                    
-                    # 檢測 UDP Flood
-                    if monitor.source_ips[source_ip] > 100:
-                        monitor.record_attack(
-                            "UDP Flood Detected",
-                            source_ip,
-                            f"來自同一來源的大量 UDP 封包 ({monitor.source_ips[source_ip]} 個)"
-                        )
-                
-                except KeyboardInterrupt:
-                    break
-                except Exception as e:
-                    print(f"UDP 監聽器錯誤: {e}")
+        max_retries = 10
+        original_port = port
         
-        except Exception as e:
-            print(f"❌ 無法啟動 UDP 監聽器: {e}")
+        for attempt in range(max_retries):
+            try:
+                udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                udp_socket.bind(('0.0.0.0', port))
+                
+                if port != original_port:
+                    print(f"✅ UDP 監聽器啟動於端口 {port} (原 {original_port} 已被佔用)")
+                else:
+                    print(f"✅ UDP 監聽器啟動於端口 {port}")
+                
+                while True:
+                    try:
+                        data, addr = udp_socket.recvfrom(65535)
+                        monitor.increment_stat('udp_packets')
+                        
+                        source_ip = addr[0]
+                        
+                        # 檢查是否是 DNS 查詢
+                        if len(data) > 12 and port == 53:
+                            monitor.increment_stat('dns_queries')
+                            monitor.record_attack(
+                                "DNS Query",
+                                source_ip,
+                                f"DNS 查詢，大小 {len(data)} bytes"
+                            )
+                        else:
+                            # 普通 UDP 封包
+                            monitor.record_attack(
+                                "UDP Packet",
+                                source_ip,
+                                f"UDP 封包，大小 {len(data)} bytes"
+                            )
+                        
+                        # 檢測 UDP Flood
+                        if monitor.source_ips[source_ip] > 100:
+                            monitor.record_attack(
+                                "UDP Flood Detected",
+                                source_ip,
+                                f"來自同一來源的大量 UDP 封包 ({monitor.source_ips[source_ip]} 個)"
+                            )
+                    
+                    except KeyboardInterrupt:
+                        break
+                    except Exception as e:
+                        print(f"UDP 監聽器錯誤: {e}")
+                
+                # 成功綁定並運行，跳出重試迴圈
+                break
+            
+            except OSError as e:
+                if e.errno == 10048 or 'address already in use' in str(e).lower():
+                    # 端口被佔用，嘗試下一個
+                    port += 1
+                    if attempt == max_retries - 1:
+                        print(f"❌ 無法啟動 UDP 監聽器: 端口 {original_port}-{port} 都已被佔用")
+                        return
+                else:
+                    print(f"❌ 無法啟動 UDP 監聽器: {e}")
+                    return
+            except Exception as e:
+                print(f"❌ 無法啟動 UDP 監聽器: {e}")
+                return
 
 # ==================== ICMP 監聽器 ====================
 class ICMPListener:
@@ -291,53 +319,93 @@ class ICMPListener:
     @staticmethod
     def start():
         """啟動 ICMP 監聽"""
-        try:
-            # 創建原始 socket (需要 root 權限)
-            icmp_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-            
-            print(f"✅ ICMP 監聽器已啟動")
-            
-            while True:
+        def is_admin():
+            if ctypes is None:
+                return False
+            try:
+                if platform.system() == 'Windows':
+                    return ctypes.windll.shell32.IsUserAnAdmin() != 0
+                else:
+                    return os.geteuid() == 0  # type: ignore
+            except:
+                return False
+
+        system = platform.system()
+        if system == 'Windows':
+            # Windows 使用 IP 原始套接字 + SIO_RCVALL 捕獲所有 IP 封包，手動過濾 ICMP
+            try:
+                if not is_admin():
+                    print("⚠️  ICMP 監聽器：需要以管理員身份執行 (Windows)")
+                    return
+                host_ip = socket.gethostbyname(socket.gethostname())
+                sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+                sniffer.bind((host_ip, 0))
+                sniffer.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+                # 啟用混雜模式 (接收所有封包)
+                SIO_RCVALL = 0x98000001
+                sniffer.ioctl(SIO_RCVALL, socket.RCVALL_ON)
+                print(f"✅ ICMP 監聽器 (Windows) 已啟動，介面 IP: {host_ip}")
+                while True:
+                    try:
+                        raw_data, addr = sniffer.recvfrom(65535)
+                        # 解析 IP 標頭
+                        if len(raw_data) < 34:
+                            continue
+                        ip_header = raw_data[:20]
+                        iph = struct.unpack('!BBHHHBBH4s4s', ip_header)
+                        protocol = iph[6]
+                        source_ip = socket.inet_ntoa(iph[8])
+                        if protocol == 1:  # ICMP
+                            monitor.increment_stat('icmp_packets')
+                            icmp_header = raw_data[20:28]
+                            try:
+                                icmph = struct.unpack('!BBHHH', icmp_header)
+                                icmp_type = icmph[0]
+                            except:
+                                icmp_type = None
+                            if icmp_type == 8:
+                                monitor.record_attack("ICMP Echo Request (Ping)", source_ip, "Ping 請求")
+                            else:
+                                monitor.record_attack("ICMP Packet", source_ip, f"ICMP 類型 {icmp_type}")
+                            if monitor.source_ips[source_ip] > 50:
+                                monitor.record_attack("ICMP Flood Detected", source_ip, "大量 ICMP 封包")
+                    except KeyboardInterrupt:
+                        break
+                    except Exception as e:
+                        print(f"ICMP 監聽器錯誤: {e}")
+            except Exception as e:
+                print(f"❌ 無法啟動 ICMP 監聽器 (Windows): {e}")
+            finally:
                 try:
-                    data, addr = icmp_socket.recvfrom(65535)
-                    monitor.increment_stat('icmp_packets')
-                    
-                    source_ip, icmp_type, icmp_code = ICMPListener.parse_icmp(data)
-                    
-                    if source_ip:
-                        # ICMP Type 8 = Echo Request (Ping)
-                        if icmp_type == 8:
-                            monitor.record_attack(
-                                "ICMP Echo Request (Ping)",
-                                source_ip,
-                                f"Ping 請求"
-                            )
-                        else:
-                            monitor.record_attack(
-                                f"ICMP Type {icmp_type}",
-                                source_ip,
-                                f"ICMP 封包，類型 {icmp_type}"
-                            )
-                        
-                        # 檢測 ICMP Flood
-                        if monitor.source_ips[source_ip] > 50:
-                            monitor.record_attack(
-                                "ICMP Flood Detected",
-                                source_ip,
-                                f"來自同一來源的大量 ICMP 封包"
-                            )
-                
-                except KeyboardInterrupt:
-                    break
-                except Exception as e:
-                    print(f"ICMP 監聽器錯誤: {e}")
-        
-        except PermissionError:
-            print(f"⚠️  ICMP 監聽器需要 root/管理員權限")
-            print(f"    Linux/Mac: sudo python3 {__file__}")
-            print(f"    Windows: 以管理員身份執行")
-        except Exception as e:
-            print(f"❌ 無法啟動 ICMP 監聽器: {e}")
+                    sniffer.ioctl(SIO_RCVALL, socket.RCVALL_OFF)  # 關閉混雜模式
+                except:
+                    pass
+        else:
+            # Linux/macOS: 使用 IPPROTO_ICMP
+            try:
+                if not is_admin():
+                    print("⚠️  ICMP 監聽器：需要 root 權限 (sudo) 才能捕獲 ICMP")
+                    return
+                icmp_socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+                print("✅ ICMP 監聽器 (Unix) 已啟動")
+                while True:
+                    try:
+                        data, addr = icmp_socket.recvfrom(65535)
+                        monitor.increment_stat('icmp_packets')
+                        source_ip, icmp_type, icmp_code = ICMPListener.parse_icmp(data)
+                        if source_ip:
+                            if icmp_type == 8:
+                                monitor.record_attack("ICMP Echo Request (Ping)", source_ip, "Ping 請求")
+                            else:
+                                monitor.record_attack("ICMP Packet", source_ip, f"ICMP 類型 {icmp_type}")
+                            if monitor.source_ips[source_ip] > 50:
+                                monitor.record_attack("ICMP Flood Detected", source_ip, "大量 ICMP 封包")
+                    except KeyboardInterrupt:
+                        break
+                    except Exception as e:
+                        print(f"ICMP 監聽器錯誤: {e}")
+            except Exception as e:
+                print(f"❌ 無法啟動 ICMP 監聽器 (Unix): {e}")
 
 # ==================== SYN Flood 檢測器 ====================
 class SYNFloodDetector:
