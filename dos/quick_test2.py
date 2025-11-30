@@ -37,17 +37,12 @@ print(f"📌 本機測試 IP: {TARGET_IP}\n")
 # ==================
 
 class AttackStats:
-    """統計資訊與延遲監控"""
+    """統計資訊"""
     def __init__(self):
         self.packets_sent = 0
         self.connections_made = 0
         self.requests_sent = 0
         self.errors = Counter()
-        self.latencies = []  # 記錄延遲
-        self.start_times = {}  # 記錄開始時間
-        self.bandwidth_used = 0  # 佔用頻寬 (bytes)
-        self.memory_snapshots = []  # 記憶體快照
-        self.cpu_snapshots = []  # CPU 快照
         self.lock = threading.Lock()
     
     def increment(self, metric, value=1):
@@ -58,41 +53,10 @@ class AttackStats:
                 self.connections_made += value
             elif metric == "requests":
                 self.requests_sent += value
-            elif metric == "bandwidth":
-                self.bandwidth_used += value
     
     def add_error(self, error_type):
         with self.lock:
             self.errors[error_type] += 1
-    
-    def record_latency(self, latency_ms):
-        """記錄延遲時間 (毫秒)"""
-        with self.lock:
-            self.latencies.append(latency_ms)
-            # 只保留最近 1000 筆
-            if len(self.latencies) > 1000:
-                self.latencies.pop(0)
-    
-    def get_avg_latency(self):
-        """取得平均延遲"""
-        with self.lock:
-            if not self.latencies:
-                return 0
-            return sum(self.latencies) / len(self.latencies)
-    
-    def get_latency_stats(self):
-        """取得延遲統計"""
-        with self.lock:
-            if not self.latencies:
-                return {'min': 0, 'max': 0, 'avg': 0, 'p95': 0}
-            sorted_lat = sorted(self.latencies)
-            p95_idx = int(len(sorted_lat) * 0.95)
-            return {
-                'min': min(sorted_lat),
-                'max': max(sorted_lat),
-                'avg': sum(sorted_lat) / len(sorted_lat),
-                'p95': sorted_lat[p95_idx] if p95_idx < len(sorted_lat) else sorted_lat[-1]
-            }
     
     def get_stats(self):
         with self.lock:
@@ -100,9 +64,7 @@ class AttackStats:
                 'packets': self.packets_sent,
                 'connections': self.connections_made,
                 'requests': self.requests_sent,
-                'bandwidth_mb': self.bandwidth_used / (1024 * 1024),
-                'errors': dict(self.errors),
-                'latency': self.get_latency_stats()
+                'errors': dict(self.errors)
             }
 
 stats = AttackStats()
@@ -325,7 +287,6 @@ class SYNFloodSimple:
         
         while running:
             try:
-                start_time = time.time()
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(0.001)  # 極短超時
                 sock.setblocking(False)
@@ -336,8 +297,6 @@ class SYNFloodSimple:
                     # 預期的錯誤，連接尚未完成
                     pass
                 
-                latency_ms = (time.time() - start_time) * 1000
-                stats.record_latency(latency_ms)
                 stats.increment("connections")
                 
                 # 保留一些半開連接，其他關閉以避免耗盡本地端口
@@ -398,22 +357,16 @@ class HTTPFlood:
                     "Connection": "keep-alive"
                 }
                 
-                start_time = time.time()
-                
                 if method == "GET":
                     response = session.get(url, headers=headers, timeout=2)
                 elif method == "POST":
                     data = {"test": random.randint(1, 10000)}
                     response = session.post(url, json=data, headers=headers, timeout=2)
                 
-                latency_ms = (time.time() - start_time) * 1000
-                stats.record_latency(latency_ms)
                 stats.increment("requests")
-                stats.increment("bandwidth", len(response.content))
                 
             except requests.exceptions.Timeout:
                 stats.add_error("HTTP Timeout")
-                stats.record_latency(2000)  # 超時記為 2000ms
             except requests.exceptions.ConnectionError:
                 stats.add_error("HTTP Connection Error")
             except Exception as e:
@@ -515,161 +468,17 @@ def print_stats_loop(start_time):
     while running:
         elapsed = time.time() - start_time
         current_stats = stats.get_stats()
-        avg_latency = stats.get_avg_latency()
         
-        sys.stdout.write("\r" + " " * 200 + "\r")
+        sys.stdout.write("\r" + " " * 150 + "\r")
         sys.stdout.write(
             f"⚡ 封包: {current_stats['packets']:,} | "
             f"連接: {current_stats['connections']:,} | "
             f"請求: {current_stats['requests']:,} | "
-            f"延遲: {avg_latency:.1f}ms | "
-            f"頻寬: {current_stats['bandwidth_mb']:.2f}MB | "
             f"時間: {elapsed:.1f}s"
         )
         sys.stdout.flush()
         
         time.sleep(0.5)
-
-def generate_attack_report(attack_type, elapsed_time, final_stats):
-    """生成攻擊測試報告"""
-    latency_stats = final_stats['latency']
-    
-    print("\n\n" + "="*80)
-    print("📊 DDoS 攻擊測試報告")
-    print("="*80)
-    
-    print(f"\n🎯 攻擊類型: {attack_type}")
-    print(f"⏱️  執行時間: {elapsed_time:.2f} 秒")
-    
-    print("\n📈 攻擊統計:")
-    print(f"  • 發送封包數: {final_stats['packets']:,}")
-    print(f"  • 建立連接數: {final_stats['connections']:,}")
-    print(f"  • HTTP 請求數: {final_stats['requests']:,}")
-    print(f"  • 佔用頻寬: {final_stats['bandwidth_mb']:.2f} MB")
-    
-    # 計算速率
-    if elapsed_time > 0:
-        pps = final_stats['packets'] / elapsed_time
-        cps = final_stats['connections'] / elapsed_time
-        rps = final_stats['requests'] / elapsed_time
-        bw_rate = final_stats['bandwidth_mb'] / elapsed_time
-        
-        print("\n⚡ 攻擊速率:")
-        if final_stats['packets'] > 0:
-            print(f"  • 封包速率: {pps:,.0f} packets/sec")
-        if final_stats['connections'] > 0:
-            print(f"  • 連接速率: {cps:,.0f} connections/sec")
-        if final_stats['requests'] > 0:
-            print(f"  • 請求速率: {rps:,.0f} requests/sec")
-        if final_stats['bandwidth_mb'] > 0:
-            print(f"  • 頻寬速率: {bw_rate:.2f} MB/sec")
-    
-    print("\n🕐 延遲統計:")
-    print(f"  • 最小延遲: {latency_stats['min']:.2f} ms")
-    print(f"  • 平均延遲: {latency_stats['avg']:.2f} ms")
-    print(f"  • 最大延遲: {latency_stats['max']:.2f} ms")
-    print(f"  • P95 延遲: {latency_stats['p95']:.2f} ms")
-    
-    if final_stats['errors']:
-        print("\n⚠️  錯誤統計:")
-        for error, count in sorted(final_stats['errors'].items(), key=lambda x: x[1], reverse=True)[:5]:
-            print(f"  • {error}: {count:,}")
-    
-    # 資源消耗分析
-    print("\n🔥 資源擁塞分析:")
-    
-    # 網路資源
-    if final_stats['packets'] > 0 or final_stats['bandwidth_mb'] > 0:
-        print("  📡 網路資源消耗:")
-        if final_stats['packets'] > 10000:
-            print(f"    ⚠️  HIGH - 封包洪水: {final_stats['packets']:,} 個封包可能導致網路擁塞")
-        if final_stats['bandwidth_mb'] > 100:
-            print(f"    ⚠️  HIGH - 頻寬耗盡: {final_stats['bandwidth_mb']:.1f} MB 可能佔滿頻寬")
-    
-    # 連接資源
-    if final_stats['connections'] > 0:
-        print("  🔌 連接資源消耗:")
-        if final_stats['connections'] > 1000:
-            print(f"    ⚠️  HIGH - 連接耗盡: {final_stats['connections']:,} 個連接可能耗盡伺服器連接池")
-        if final_stats['connections'] > 100:
-            print(f"    ⚠️  MEDIUM - 建立了 {final_stats['connections']:,} 個半開連接")
-    
-    # CPU 資源
-    if final_stats['requests'] > 0:
-        print("  💻 CPU 資源消耗:")
-        if final_stats['requests'] > 10000:
-            print(f"    ⚠️  HIGH - 請求處理: {final_stats['requests']:,} 個請求可能導致 CPU 過載")
-    
-    # 延遲影響
-    if latency_stats['avg'] > 0:
-        print("  ⏱️  延遲影響:")
-        if latency_stats['avg'] > 1000:
-            print(f"    ⚠️  CRITICAL - 平均延遲 {latency_stats['avg']:.0f}ms，服務嚴重降級")
-        elif latency_stats['avg'] > 500:
-            print(f"    ⚠️  HIGH - 平均延遲 {latency_stats['avg']:.0f}ms，服務明顯變慢")
-        elif latency_stats['avg'] > 200:
-            print(f"    ⚠️  MEDIUM - 平均延遲 {latency_stats['avg']:.0f}ms，使用者可感知")
-        else:
-            print(f"    ✅ LOW - 平均延遲 {latency_stats['avg']:.0f}ms，影響較小")
-        
-        if latency_stats['p95'] > 2000:
-            print(f"    ⚠️  CRITICAL - P95 延遲 {latency_stats['p95']:.0f}ms，5% 請求嚴重超時")
-    
-    # 攻擊效果評估
-    print("\n📊 攻擊效果評估:")
-    
-    if attack_type in ["ICMP Flood", "UDP Flood"]:
-        if final_stats['packets'] > 100000:
-            print("  🔴 極高 - 大量封包可能導致網路設備過載")
-        elif final_stats['packets'] > 10000:
-            print("  🟠 高 - 封包數量足以影響網路效能")
-        else:
-            print("  🟡 中 - 封包數量有限，影響較小")
-    
-    elif attack_type in ["SYN Flood", "SYN Flood (簡化版)"]:
-        if final_stats['connections'] > 5000:
-            print("  🔴 極高 - 大量半開連接可能耗盡連接表")
-        elif final_stats['connections'] > 1000:
-            print("  🟠 高 - 連接數足以影響伺服器效能")
-        else:
-            print("  🟡 中 - 連接數有限，影響較小")
-    
-    elif attack_type in ["HTTP GET Flood", "HTTP POST Flood"]:
-        if final_stats['requests'] > 50000:
-            print("  🔴 極高 - 大量請求可能導致應用層癱瘓")
-        elif final_stats['requests'] > 10000:
-            print("  🟠 高 - 請求數足以影響應用效能")
-        else:
-            print("  🟡 中 - 請求數有限，影響較小")
-    
-    elif attack_type == "Slowloris":
-        if final_stats['connections'] > 100:
-            print("  🔴 極高 - 長時間佔用連接可能導致新連接被拒絕")
-        else:
-            print("  🟡 中 - 連接數不足以完全阻斷服務")
-    
-    elif attack_type == "組合攻擊":
-        total_impact = 0
-        if final_stats['packets'] > 10000: total_impact += 1
-        if final_stats['connections'] > 1000: total_impact += 1
-        if final_stats['requests'] > 10000: total_impact += 1
-        if latency_stats['avg'] > 500: total_impact += 1
-        
-        if total_impact >= 3:
-            print("  🔴 極高 - 多維度攻擊造成嚴重資源擁塞")
-        elif total_impact >= 2:
-            print("  🟠 高 - 組合攻擊對多個資源造成壓力")
-        else:
-            print("  🟡 中 - 組合攻擊效果有限")
-    
-    print("\n💡 建議:")
-    print("  1. 實施速率限制 (Rate Limiting)")
-    print("  2. 配置連接超時與最大連接數")
-    print("  3. 啟用 SYN Cookie 防護")
-    print("  4. 使用 CDN 或反向代理進行流量過濾")
-    print("  5. 監控異常流量並自動封鎖可疑 IP")
-    
-    print("\n" + "="*80)
 
 def run_attack_suite():
     """執行攻擊測試套件"""
@@ -839,23 +648,22 @@ def run_attack_suite():
     for t in threads:
         t.join(timeout=1)
     
-    # 獲取最終統計並生成報告
+    # 最終統計
     final_stats = stats.get_stats()
+    print("\n\n" + "="*80)
+    print("📊 攻擊測試完成")
+    print("="*80)
+    print(f"執行時間: {elapsed:.2f} 秒")
+    print(f"發送封包: {final_stats['packets']:,}")
+    print(f"建立連接: {final_stats['connections']:,}")
+    print(f"HTTP 請求: {final_stats['requests']:,}")
     
-    # 確定攻擊類型名稱
-    attack_type_names = {
-        "1": "ICMP Flood",
-        "2": "SYN Flood",
-        "3": "SYN Flood (簡化版)",
-        "4": "HTTP GET Flood",
-        "5": "HTTP POST Flood",
-        "6": "Slowloris",
-        "7": "UDP Flood",
-        "8": "組合攻擊"
-    }
+    if final_stats['errors']:
+        print(f"\n錯誤統計:")
+        for error, count in final_stats['errors'].most_common(5):
+            print(f"  {error}: {count:,}")
     
-    attack_name = attack_type_names.get(choice, "未知攻擊")
-    generate_attack_report(attack_name, elapsed, final_stats)
+    print("="*80)
 
 if __name__ == "__main__":
     run_attack_suite()

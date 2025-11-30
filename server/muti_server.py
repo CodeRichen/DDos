@@ -12,6 +12,11 @@ from collections import Counter, deque
 from datetime import datetime
 import json
 import platform
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import os
+import hashlib
+import base64
+import psutil
 
 try:
     import ctypes
@@ -19,10 +24,11 @@ except ImportError:
     ctypes = None
 
 # ===== 配置區 =====
-TCP_PORT = 8000      # TCP (HTTP) 端口
+TCP_PORT = 8000      # TCP (攻擊監聽) 端口
 UDP_PORT = 9001      # UDP 端口 (避開 8001 常見衝突)
 DNS_PORT = 53        # DNS 端口 (需要 root)
 MONITOR_ICMP = True  # 是否監控 ICMP (需要 root)
+WEB_PORT = 8888      # 網頁介面端口
 # ==================
 
 class AttackMonitor:
@@ -67,12 +73,37 @@ class AttackMonitor:
         """獲取統計摘要"""
         with self.lock:
             elapsed = time.time() - self.start_time
+            # 取最後 20 條攻擊記錄
+            recent = list(self.recent_attacks)
+            if len(recent) > 20:
+                recent = recent[-20:]
+            
+            # 獲取系統資源
+            try:
+                cpu_percent = psutil.cpu_percent(interval=0.1)
+                memory = psutil.virtual_memory()
+                memory_percent = memory.percent
+                net_io = psutil.net_io_counters()
+                net_sent_kb = net_io.bytes_sent / 1024
+                net_recv_kb = net_io.bytes_recv / 1024
+            except:
+                cpu_percent = 0
+                memory_percent = 0
+                net_sent_kb = 0
+                net_recv_kb = 0
+            
             return {
                 'uptime': elapsed,
                 'stats': dict(self.stats),
                 'attack_types': dict(self.attack_types.most_common(10)),
                 'top_attackers': dict(self.source_ips.most_common(10)),
-                'recent_attacks': list(self.recent_attacks)[-20:]
+                'recent_attacks': recent,
+                'system': {
+                    'cpu': cpu_percent,
+                    'memory': memory_percent,
+                    'net_sent': net_sent_kb,
+                    'net_recv': net_recv_kb
+                }
             }
     
     def print_summary(self):
@@ -422,6 +453,143 @@ def print_stats_periodically():
         time.sleep(10)  # 每 10 秒打印一次
         monitor.print_summary()
 
+# ==================== WebSocket 處理器 ====================
+websocket_clients = []
+websocket_lock = threading.Lock()
+
+class WebSocketHandler(SimpleHTTPRequestHandler):
+    """HTTP + WebSocket 處理器"""
+    
+    def do_GET(self):
+        """處理 HTTP GET 請求"""
+        if self.path == '/':
+            self.path = '/templates/attack_monitor.html'
+        elif self.path == '/ws':
+            self.handle_websocket()
+            return
+        
+        # 處理靜態文件
+        if self.path.startswith('/templates/'):
+            try:
+                file_path = os.path.join(os.path.dirname(__file__), self.path.lstrip('/'))
+                if os.path.exists(file_path):
+                    with open(file_path, 'rb') as f:
+                        content = f.read()
+                    self.send_response(200)
+                    if file_path.endswith('.html'):
+                        self.send_header('Content-type', 'text/html; charset=utf-8')
+                    elif file_path.endswith('.css'):
+                        self.send_header('Content-type', 'text/css')
+                    elif file_path.endswith('.js'):
+                        self.send_header('Content-type', 'application/javascript')
+                    self.end_headers()
+                    self.wfile.write(content)
+                else:
+                    self.send_error(404)
+            except Exception as e:
+                print(f"文件讀取錯誤: {e}")
+                self.send_error(500)
+        else:
+            self.send_error(404)
+    
+    def handle_websocket(self):
+        """處理 WebSocket 升級"""
+        try:
+            key = self.headers.get('Sec-WebSocket-Key')
+            if not key:
+                self.send_error(400, 'Bad Request')
+                return
+            
+            magic = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+            accept_key = base64.b64encode(
+                hashlib.sha1((key + magic).encode()).digest()
+            ).decode()
+            
+            self.send_response(101, 'Switching Protocols')
+            self.send_header('Upgrade', 'websocket')
+            self.send_header('Connection', 'Upgrade')
+            self.send_header('Sec-WebSocket-Accept', accept_key)
+            self.end_headers()
+            
+            with websocket_lock:
+                websocket_clients.append(self.connection)
+            
+            print(f"✅ WebSocket 客戶端已連接，當前連接數: {len(websocket_clients)}")
+            
+            while True:
+                time.sleep(1)
+        
+        except Exception as e:
+            print(f"WebSocket 錯誤: {e}")
+        finally:
+            with websocket_lock:
+                if self.connection in websocket_clients:
+                    websocket_clients.remove(self.connection)
+            print(f"WebSocket 客戶端已斷開，當前連接數: {len(websocket_clients)}")
+    
+    def log_message(self, format, *args):
+        """靜默日誌"""
+        pass
+
+def broadcast_stats():
+    """定期廣播統計數據給所有 WebSocket 客戶端"""
+    print("📡 WebSocket 廣播線程已啟動")
+    last_broadcast = 0
+    while True:
+        try:
+            time.sleep(1)
+            
+            if len(websocket_clients) == 0:
+                continue
+            
+            summary = monitor.get_summary()
+            data = json.dumps(summary).encode('utf-8')
+            
+            # 每 10 秒打印一次狀態
+            current_time = time.time()
+            if current_time - last_broadcast >= 10:
+                print(f"📤 廣播: TCP={summary['stats']['tcp_connections']}, 客戶端={len(websocket_clients)}")
+                last_broadcast = current_time
+            
+            frame = bytearray()
+            frame.append(0x81)
+            
+            payload_len = len(data)
+            if payload_len < 126:
+                frame.append(payload_len)
+            elif payload_len < 65536:
+                frame.append(126)
+                frame.extend(payload_len.to_bytes(2, 'big'))
+            else:
+                frame.append(127)
+                frame.extend(payload_len.to_bytes(8, 'big'))
+            
+            frame.extend(data)
+            
+            with websocket_lock:
+                disconnected = []
+                for client in websocket_clients:
+                    try:
+                        client.sendall(bytes(frame))
+                    except:
+                        disconnected.append(client)
+                
+                for client in disconnected:
+                    websocket_clients.remove(client)
+        
+        except Exception as e:
+            print(f"廣播錯誤: {e}")
+
+def start_web_server(port):
+    """啟動網頁伺服器"""
+    try:
+        server = HTTPServer(('0.0.0.0', port), WebSocketHandler)
+        print(f"✅ 網頁介面啟動於 http://0.0.0.0:{port}")
+        print(f"   在瀏覽器中打開: http://localhost:{port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"❌ 無法啟動網頁伺服器: {e}")
+
 # ==================== 主程式 ====================
 def main():
     print("="*80)
@@ -434,6 +602,18 @@ def main():
     print("="*80 + "\n")
     
     threads = []
+    
+    # 啟動網頁伺服器
+    web_thread = threading.Thread(target=start_web_server, args=(WEB_PORT,), daemon=True)
+    web_thread.start()
+    threads.append(web_thread)
+    time.sleep(0.5)
+    
+    # 啟動 WebSocket 廣播
+    broadcast_thread = threading.Thread(target=broadcast_stats, daemon=True)
+    broadcast_thread.start()
+    threads.append(broadcast_thread)
+    time.sleep(0.5)
     
     # 啟動 TCP 監聽器
     tcp_thread = threading.Thread(target=TCPListener.start, args=(TCP_PORT,), daemon=True)
@@ -471,25 +651,23 @@ def main():
     print("✅ 所有監聽器已啟動")
     print("="*80)
     print("📊 即時監控:")
-    print(f"  - TCP 端口: {TCP_PORT}")
-    print(f"  - UDP 端口: {UDP_PORT}")
+    print(f"  - 攻擊監聽 TCP: {TCP_PORT}")
+    print(f"  - 攻擊監聽 UDP: {UDP_PORT}")
     if MONITOR_ICMP:
         print(f"  - ICMP: 已啟用")
-    print("\n💡 使用攻擊工具測試各種攻擊方式")
-    print("   按 Ctrl+C 停止並查看完整報告\n")
+    print(f"  - 網頁介面: http://localhost:{WEB_PORT}")
+    print("\n💡 打開瀏覽器訪問網頁介面查看即時數據")
+    print("   使用攻擊工具測試各種攻擊方式")
+    print("   按 Ctrl+C 停止伺服器\n")
     print("="*80 + "\n")
     
     try:
-        # 主線程保持運行
         while True:
             time.sleep(1)
     
     except KeyboardInterrupt:
         print("\n\n⏹️  正在關閉伺服器...")
-        
-        # 生成最終報告
         monitor.print_summary()
-        
         print("\n✅ 伺服器已關閉\n")
 
 if __name__ == '__main__':

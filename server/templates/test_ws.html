@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WebSocket 測試</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #1e1e1e;
+            color: #d4d4d4;
+        }
+        #log {
+            background: #252526;
+            padding: 15px;
+            border-radius: 5px;
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        .entry {
+            margin: 5px 0;
+            padding: 5px;
+            border-left: 3px solid #007acc;
+        }
+        .error {
+            border-left-color: #f48771;
+        }
+        .success {
+            border-left-color: #4ec9b0;
+        }
+        h1 {
+            color: #4ec9b0;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebSocket 連接測試</h1>
+    <div id="log"></div>
+    
+    <script>
+        const logDiv = document.getElementById('log');
+        
+        function log(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logDiv.appendChild(entry);
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+        
+        log('開始連接 WebSocket...', 'info');
+        
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        
+        log(`連接到: ${wsUrl}`, 'info');
+        
+        const ws = new WebSocket(wsUrl);
+        
+        ws.onopen = () => {
+            log('✅ WebSocket 連接成功！', 'success');
+        };
+        
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                log(`📥 收到數據:`, 'success');
+                log(`  - 運行時間: ${Math.floor(data.uptime)}秒`, 'info');
+                log(`  - TCP 連接: ${data.stats.tcp_connections}`, 'info');
+                log(`  - HTTP 請求: ${data.stats.http_requests}`, 'info');
+                log(`  - UDP 封包: ${data.stats.udp_packets}`, 'info');
+                log(`  - ICMP 封包: ${data.stats.icmp_packets}`, 'info');
+                log(`  - 攻擊類型數: ${Object.keys(data.attack_types).length}`, 'info');
+                log(`  - 攻擊事件數: ${data.recent_attacks.length}`, 'info');
+                if (data.system) {
+                    log(`  - CPU: ${data.system.cpu.toFixed(1)}%`, 'info');
+                    log(`  - 記憶體: ${data.system.memory.toFixed(1)}%`, 'info');
+                }
+                log('---', 'info');
+            } catch (e) {
+                log(`❌ 解析錯誤: ${e.message}`, 'error');
+                log(`原始數據: ${event.data.substring(0, 100)}...`, 'error');
+            }
+        };
+        
+        ws.onerror = (error) => {
+            log(`❌ WebSocket 錯誤: ${error}`, 'error');
+        };
+        
+        ws.onclose = () => {
+            log('❌ WebSocket 連接關閉', 'error');
+        };
+    </script>
+</body>
+</html>

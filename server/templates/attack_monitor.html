@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>多協議攻擊監控</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+            color: white;
+            padding: 15px;
+            overflow: hidden;
+            height: 100vh;
+        }
+        
+        h1 {
+            text-align: center;
+            margin-bottom: 15px;
+            font-size: 1.8em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        
+        .main-grid {
+            display: grid;
+            grid-template-columns: 400px 1fr;
+            gap: 15px;
+            height: calc(100vh - 80px);
+        }
+        
+        /* 左側：攻擊類型統計 */
+        .left-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        
+        .attack-types-card {
+            background: rgba(255,255,255,0.08);
+            backdrop-filter: blur(10px);
+            border-radius: 10px;
+            padding: 12px;
+            border: 1px solid rgba(255,255,255,0.15);
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .attack-types-card h2 {
+            font-size: 1em;
+            margin-bottom: 10px;
+            color: #f87171;
+        }
+        
+        .attack-types-list {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
+        .attack-type-item {
+            background: rgba(0,0,0,0.3);
+            padding: 10px;
+            border-radius: 6px;
+            border-left: 3px solid #ef4444;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.3s ease;
+        }
+        
+        .attack-type-name {
+            font-size: 0.85em;
+            color: #fca5a5;
+        }
+        
+        .attack-type-count {
+            font-size: 1.3em;
+            font-weight: bold;
+            color: #ffffff;
+        }
+        
+        /* 右側面板 */
+        .right-panel {
+            display: grid;
+            grid-template-rows: auto 1fr;
+            gap: 15px;
+        }
+        
+        /* 上方：系統效能數據 */
+        .top-section {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            height: auto;
+        }
+        
+        .perf-card {
+            background: rgba(255,255,255,0.08);
+            backdrop-filter: blur(10px);
+            border-radius: 10px;
+            padding: 12px;
+            border: 1px solid rgba(255,255,255,0.15);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        
+        .perf-card h3 {
+            font-size: 0.75em;
+            color: #a8dadc;
+            margin-bottom: 5px;
+        }
+        
+        .perf-value {
+            font-size: 1.4em;
+            font-weight: bold;
+            color: #4ade80;
+            transition: color 0.2s ease;
+        }
+        
+        .perf-value.updating {
+            color: #fbbf24;
+        }
+        
+        /* 攻擊來源 IP */
+        .top-ips-card {
+            background: rgba(255,255,255,0.08);
+            backdrop-filter: blur(10px);
+            border-radius: 10px;
+            padding: 12px;
+            border: 1px solid rgba(255,255,255,0.15);
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .top-ips-card h2 {
+            font-size: 1em;
+            color: #fbbf24;
+            margin-bottom: 10px;
+        }
+        
+        .top-ips {
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .ip-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 6px 10px;
+            background: rgba(0,0,0,0.25);
+            border-radius: 5px;
+            margin-bottom: 5px;
+            font-size: 0.85em;
+        }
+        
+        .ip-addr {
+            color: #60a5fa;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .ip-count {
+            color: #fbbf24;
+            font-weight: bold;
+        }
+        
+        /* 下方：攻擊列表 */
+        .attacks-list-card {
+            background: rgba(255,255,255,0.08);
+            backdrop-filter: blur(10px);
+            border-radius: 10px;
+            padding: 12px;
+            border: 1px solid rgba(255,255,255,0.15);
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .attacks-list-card h2 {
+            font-size: 1em;
+            color: #f87171;
+            margin-bottom: 10px;
+        }
+        
+        .attacks-list {
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .attack-item {
+            background: rgba(0,0,0,0.25);
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            border-left: 3px solid #6366f1;
+            font-size: 0.85em;
+        }
+        
+        .attack-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+        }
+        
+        .attack-type {
+            font-weight: bold;
+            color: #fbbf24;
+        }
+        
+        .attack-time {
+            font-size: 0.75em;
+            color: #94a3b8;
+        }
+        
+        .attack-source {
+            color: #60a5fa;
+            font-size: 0.8em;
+            margin-bottom: 2px;
+        }
+        
+        .attack-details {
+            font-size: 0.75em;
+            color: #cbd5e1;
+        }
+        
+        /* 滾動條 */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(0,0,0,0.2);
+            border-radius: 3px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,0.3);
+            border-radius: 3px;
+        }
+        
+        /* 連接狀態 */
+        .connection-status {
+            position: fixed;
+            top: 15px;
+            right: 15px;
+            padding: 6px 12px;
+            border-radius: 15px;
+            font-size: 0.8em;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(0,0,0,0.5);
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+        }
+        
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+        }
+        
+        .status-dot.disconnected {
+            background: #ef4444;
+        }
+    </style>
+</head>
+<body>
+    <div class="connection-status">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">已連接</span>
+    </div>
+    
+    <h1>🛡️ 多協議攻擊監控系統</h1>
+    
+    <div class="main-grid">
+        <!-- 左側：攻擊類型統計 -->
+        <div class="left-panel">
+            <div class="attack-types-card">
+                <h2>🎯 攻擊類型統計 (依數量排序)</h2>
+                <div class="attack-types-list" id="attackTypesList">
+                    <div class="attack-type-item">
+                        <span class="attack-type-name">等待數據...</span>
+                        <span class="attack-type-count">0</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 右側面板 -->
+        <div class="right-panel">
+            <!-- 上方：系統效能數據 -->
+            <div class="top-section">
+                <div class="perf-card">
+                    <h3>💻 CPU 使用率</h3>
+                    <div class="perf-value" id="cpu">0%</div>
+                </div>
+                
+                <div class="perf-card">
+                    <h3>🧠 記憶體使用</h3>
+                    <div class="perf-value" id="memory">0%</div>
+                </div>
+                
+                <div class="perf-card">
+                    <h3>📤 網路發送</h3>
+                    <div class="perf-value" id="netSent">0 MB</div>
+                </div>
+                
+                <div class="perf-card">
+                    <h3>📥 網路接收</h3>
+                    <div class="perf-value" id="netRecv">0 MB</div>
+                </div>
+            </div>
+            
+            <!-- 中間：Top 攻擊來源 -->
+            <div class="top-ips-card">
+                <h2>🔴 Top 攻擊來源 IP</h2>
+                <div class="top-ips" id="topIps">
+                    <div class="ip-item">
+                        <span class="ip-addr">等待數據...</span>
+                        <span class="ip-count">0</span>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- 下方：攻擊事件列表 -->
+            <div class="attacks-list-card">
+                <h2>📋 攻擊事件 (最近 20 條)</h2>
+                <div class="attacks-list" id="attacksList">
+                    <div class="attack-item">
+                        <div class="attack-header">
+                            <span class="attack-type">等待數據...</span>
+                            <span class="attack-time">--:--:--</span>
+                        </div>
+                        <div class="attack-source">來源: --</div>
+                        <div class="attack-details">等待連接</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let ws = null;
+        let reconnectInterval = null;
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        
+        // 緩存上一次的數據，用於比較
+        let lastData = {
+            cpu: null,
+            memory: null,
+            netSent: null,
+            netRecv: null,
+            attackTypes: {},
+            topIps: {},
+            recentAttacks: []
+        };
+        
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('WebSocket 連接成功');
+                statusDot.classList.remove('disconnected');
+                statusText.textContent = '已連接';
+                if (reconnectInterval) {
+                    clearInterval(reconnectInterval);
+                    reconnectInterval = null;
+                }
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    console.log('📥 收到數據:', {
+                        tcp: data.stats.tcp_connections,
+                        cpu: data.system?.cpu,
+                        attackTypes: Object.keys(data.attack_types).length,
+                        attacks: data.recent_attacks.length
+                    });
+                    updateDashboard(data);
+                } catch (e) {
+                    console.error('解析數據錯誤:', e, event.data.substring(0, 100));
+                }
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket 錯誤:', error);
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket 連接關閉');
+                statusDot.classList.add('disconnected');
+                statusText.textContent = '連接中斷';
+                
+                if (!reconnectInterval) {
+                    reconnectInterval = setInterval(() => {
+                        console.log('嘗試重新連接...');
+                        connect();
+                    }, 3000);
+                }
+            };
+        }
+        
+        function updateDashboard(data) {
+            // 更新系統資源（只在數值改變時更新）
+            if (data.system) {
+                const cpuValue = data.system.cpu.toFixed(1) + '%';
+                if (lastData.cpu !== cpuValue) {
+                    updateValue('cpu', cpuValue);
+                    lastData.cpu = cpuValue;
+                }
+                
+                const memValue = data.system.memory.toFixed(1) + '%';
+                if (lastData.memory !== memValue) {
+                    updateValue('memory', memValue);
+                    lastData.memory = memValue;
+                }
+                
+                const sentValue = (data.system.net_sent / 1024).toFixed(2) + ' MB';
+                if (lastData.netSent !== sentValue) {
+                    updateValue('netSent', sentValue);
+                    lastData.netSent = sentValue;
+                }
+                
+                const recvValue = (data.system.net_recv / 1024).toFixed(2) + ' MB';
+                if (lastData.netRecv !== recvValue) {
+                    updateValue('netRecv', recvValue);
+                    lastData.netRecv = recvValue;
+                }
+            }
+            
+            // 更新攻擊類型（依數量排序，有變化才更新）
+            if (data.attack_types && Object.keys(data.attack_types).length > 0) {
+                const newHash = JSON.stringify(data.attack_types);
+                const oldHash = JSON.stringify(lastData.attackTypes);
+                if (newHash !== oldHash) {
+                    updateAttackTypes(data.attack_types);
+                    lastData.attackTypes = data.attack_types;
+                }
+            }
+            
+            // 更新 Top IP（有變化才更新）
+            if (data.top_attackers && Object.keys(data.top_attackers).length > 0) {
+                const newHash = JSON.stringify(data.top_attackers);
+                const oldHash = JSON.stringify(lastData.topIps);
+                if (newHash !== oldHash) {
+                    updateTopIps(data.top_attackers);
+                    lastData.topIps = data.top_attackers;
+                }
+            }
+            
+            // 更新攻擊列表（只在有新攻擊時更新）
+            if (data.recent_attacks && data.recent_attacks.length > 0) {
+                const newLastAttack = data.recent_attacks[data.recent_attacks.length - 1];
+                const oldLastAttack = lastData.recentAttacks.length > 0 ? 
+                    lastData.recentAttacks[lastData.recentAttacks.length - 1] : null;
+                
+                // 只有當最新的攻擊時間戳不同時才更新
+                if (!oldLastAttack || newLastAttack.timestamp !== oldLastAttack.timestamp) {
+                    updateAttacksList(data.recent_attacks);
+                    lastData.recentAttacks = data.recent_attacks;
+                }
+            }
+        }
+        
+        function updateValue(id, newValue) {
+            const element = document.getElementById(id);
+            element.classList.add('updating');
+            element.textContent = newValue;
+            setTimeout(() => {
+                element.classList.remove('updating');
+            }, 200);
+        }
+        
+        function updateAttackTypes(types) {
+            // 排序：數量由大到小
+            const sortedEntries = Object.entries(types).sort((a, b) => b[1] - a[1]);
+            const container = document.getElementById('attackTypesList');
+            
+            container.innerHTML = sortedEntries.map(([type, count]) => `
+                <div class="attack-type-item">
+                    <span class="attack-type-name">${escapeHtml(type)}</span>
+                    <span class="attack-type-count">${count}</span>
+                </div>
+            `).join('');
+        }
+        
+        function updateTopIps(ips) {
+            const container = document.getElementById('topIps');
+            const entries = Object.entries(ips).slice(0, 10);
+            
+            container.innerHTML = entries.map(([ip, count]) => `
+                <div class="ip-item">
+                    <span class="ip-addr">${escapeHtml(ip)}</span>
+                    <span class="ip-count">${count}</span>
+                </div>
+            `).join('');
+        }
+        
+        function updateAttacksList(attacks) {
+            const container = document.getElementById('attacksList');
+            const reversed = [...attacks].reverse();
+            
+            container.innerHTML = reversed.map((attack) => `
+                <div class="attack-item">
+                    <div class="attack-header">
+                        <span class="attack-type">${escapeHtml(attack.type)}</span>
+                        <span class="attack-time">${escapeHtml(attack.timestamp.split(' ')[1])}</span>
+                    </div>
+                    <div class="attack-source">來源: ${escapeHtml(attack.source)}</div>
+                    <div class="attack-details">${escapeHtml(attack.details || '無詳細資訊')}</div>
+                </div>
+            `).join('');
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        connect();
+    </script>
+</body>
+</html>
