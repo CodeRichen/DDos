@@ -11,7 +11,7 @@
             background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
             color: white;
             padding: 15px;
-            overflow: hidden;
+            overflow-y: auto;
             height: 100vh;
         }
         
@@ -226,6 +226,44 @@
             color: #cbd5e1;
         }
         
+        /* 底層操作步驟 */
+        .attack-operations {
+            margin-top: 8px;
+            padding: 8px;
+            background: rgba(0,0,0,0.4);
+            border-radius: 4px;
+            border-left: 2px solid #8b5cf6;
+        }
+        
+        .operations-title {
+            font-size: 0.7em;
+            color: #c084fc;
+            font-weight: bold;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .operations-list {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+        
+        .operation-step {
+            font-size: 0.65em;
+            color: #e0e7ff;
+            font-family: 'Consolas', 'Courier New', monospace;
+            padding: 2px 0;
+        }
+        
+        .operation-step:before {
+            content: "▪";
+            color: #8b5cf6;
+            margin-right: 4px;
+        }
+        
         /* 滾動條 */
         ::-webkit-scrollbar {
             width: 6px;
@@ -329,7 +367,7 @@
             
             <!-- 下方：攻擊事件列表 -->
             <div class="attacks-list-card">
-                <h2>📋 攻擊事件 (最近 20 條)</h2>
+                <h2>📋 攻擊事件 (最近 50 條)</h2>
                 <div class="attacks-list" id="attacksList">
                     <div class="attack-item">
                         <div class="attack-header">
@@ -510,16 +548,38 @@
             const container = document.getElementById('attacksList');
             const reversed = [...attacks].reverse();
             
-            container.innerHTML = reversed.map((attack) => `
-                <div class="attack-item">
-                    <div class="attack-header">
-                        <span class="attack-type">${escapeHtml(attack.type)}</span>
-                        <span class="attack-time">${escapeHtml(attack.timestamp.split(' ')[1])}</span>
+            container.innerHTML = reversed.map((attack) => {
+                // 構建底層操作步驟 HTML
+                let operationsHtml = '';
+                if (attack.operations && attack.operations.length > 0) {
+                    const operationsList = attack.operations.map(op => 
+                        `<div class="operation-step">${escapeHtml(op)}</div>`
+                    ).join('');
+                    
+                    operationsHtml = `
+                        <div class="attack-operations">
+                            <div class="operations-title">
+                                🔧 伺服器底層操作步驟 (${attack.operations.length} 步)
+                            </div>
+                            <div class="operations-list">
+                                ${operationsList}
+                            </div>
+                        </div>
+                    `;
+                }
+                
+                return `
+                    <div class="attack-item">
+                        <div class="attack-header">
+                            <span class="attack-type">${escapeHtml(attack.type)}</span>
+                            <span class="attack-time">${escapeHtml(attack.timestamp.split(' ')[1])}</span>
+                        </div>
+                        <div class="attack-source">來源: ${escapeHtml(attack.source)}</div>
+                        <div class="attack-details">${escapeHtml(attack.details || '無詳細資訊')}</div>
+                        ${operationsHtml}
                     </div>
-                    <div class="attack-source">來源: ${escapeHtml(attack.source)}</div>
-                    <div class="attack-details">${escapeHtml(attack.details || '無詳細資訊')}</div>
-                </div>
-            `).join('');
+                `;
+            }).join('');
         }
         
         function escapeHtml(text) {

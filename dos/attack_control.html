@@ -211,14 +211,14 @@
         .btn-http { border-color: #10b981; }
         .btn-slowloris { border-color: #8b5cf6; }
         .btn-udp { border-color: #06b6d4; }
-        .btn-combo { border-color: #f59e0b; }
+        .btn-dns { border-color: #f59e0b; }
         
         /* 選中狀態優先級更高 - 必須在按鈕類型樣式之後 */
         .attack-button.selected.btn-syn,
         .attack-button.selected.btn-http,
         .attack-button.selected.btn-slowloris,
         .attack-button.selected.btn-udp,
-        .attack-button.selected.btn-combo {
+        .attack-button.selected.btn-dns {
             background: rgba(59, 130, 246, 0.3) !important;
             border-color: #3b82f6 !important;
             box-shadow: 0 0 20px rgba(59, 130, 246, 0.6) !important;
@@ -453,11 +453,11 @@
                         <div class="latency-display" id="latency-udp">📊 就緒</div>
                     </button>
                     
-                    <button class="attack-button btn-combo" data-attack="combo">
-                        <div class="icon">🔥</div>
-                        <div class="name">組合攻擊</div>
-                        <div class="desc">多重攻擊模式</div>
-                        <div class="latency-display" id="latency-combo">📊 就緒</div>
+                    <button class="attack-button btn-dns" data-attack="dns-amp">
+                        <div class="icon">📡</div>
+                        <div class="name">DNS 放大攻擊</div>
+                        <div class="desc">DNS 放大查詢</div>
+                        <div class="latency-display" id="latency-dns-amp">📊 就緒</div>
                     </button>
                 </div>
             </div>
@@ -545,13 +545,13 @@
         };
         
         // 延遲數據
-        const latencyData = {
+        let latency_data = {
             'syn': [],
             'http-get': [],
             'http-post': [],
             'slowloris': [],
             'udp': [],
-            'combo': []
+            'dns-amp': []
         };
         
         // DOM 元素
@@ -683,7 +683,7 @@
             }
             
             // 重置延遲顯示
-            Object.keys(latencyData).forEach(type => {
+            Object.keys(latency_data).forEach(type => {
                 const elem = document.getElementById(`latency-${type}`);
                 if (elem) {
                     elem.textContent = '📊 就緒';
@@ -751,16 +751,23 @@
         }
         
         function updateLatency() {
+            if (!isAttacking) return;  // 如果攻擊已停止，不再更新
+            
             // 從後端獲取延遲數據
             fetch('http://localhost:5000/api/latency')
-                .then(res => res.json())
+                .then(res => {
+                    if (!res.ok) {
+                        throw new Error(`HTTP ${res.status}`);
+                    }
+                    return res.json();
+                })
                 .then(data => {
                     console.log('收到延遲數據:', data);
                     Object.keys(data).forEach(attackType => {
                         const latency = data[attackType];
                         const elem = document.getElementById(`latency-${attackType}`);
                         
-                        if (elem && latency !== null && latency !== undefined) {
+                        if (elem && latency !== null && latency !== undefined && latency > 0) {
                             // 更新延遲顯示
                             elem.textContent = `⏱️ ${latency.toFixed(1)}ms`;
                             
@@ -778,6 +785,7 @@
                 })
                 .catch(err => {
                     console.error('獲取延遲數據失敗:', err);
+                    // 不要讓錯誤影響整體運行
                 });
         }
         
@@ -840,11 +848,16 @@
             
             try {
                 const response = await fetch('/api/stats');
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
                 const data = await response.json();
                 
-                stats.packets = data.packets;
-                stats.connections = data.connections;
-                stats.requests = data.requests;
+                stats.packets = data.packets || 0;
+                stats.connections = data.connections || 0;
+                stats.requests = data.requests || 0;
                 stats.retries = data.retries || 0;
                 stats.successful_requests = data.successful_requests || 0;
                 stats.failed_requests = data.failed_requests || 0;
@@ -856,7 +869,10 @@
                 setTimeout(pollStats, 500);
             } catch (error) {
                 console.error('獲取統計數據失敗:', error);
-                setTimeout(pollStats, 1000);
+                // 如果仍在攻擊中，繼續嘗試
+                if (isAttacking) {
+                    setTimeout(pollStats, 1000);
+                }
             }
         }
         

