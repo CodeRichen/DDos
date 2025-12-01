@@ -162,6 +162,12 @@
             animation: pulse-glow 2s infinite;
         }
         
+        .attack-button.selected {
+            background: rgba(59, 130, 246, 0.3);
+            border-color: #3b82f6 !important;
+            box-shadow: 0 0 20px rgba(59, 130, 246, 0.6);
+        }
+        
         @keyframes pulse-glow {
             0%, 100% { box-shadow: 0 0 10px rgba(76, 222, 128, 0.5); }
             50% { box-shadow: 0 0 20px rgba(76, 222, 128, 0.8); }
@@ -182,12 +188,42 @@
             color: #cbd5e1;
         }
         
+        .attack-button .latency-display {
+            font-size: 0.75em;
+            color: #4ade80;
+            font-weight: bold;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            min-height: 18px;
+        }
+        
+        .attack-button .latency-display.high {
+            color: #fbbf24;
+        }
+        
+        .attack-button .latency-display.critical {
+            color: #ef4444;
+        }
+        
         .btn-icmp { border-color: #3b82f6; }
         .btn-syn { border-color: #ef4444; }
         .btn-http { border-color: #10b981; }
         .btn-slowloris { border-color: #8b5cf6; }
         .btn-udp { border-color: #06b6d4; }
         .btn-combo { border-color: #f59e0b; }
+        
+        /* 選中狀態優先級更高 - 必須在按鈕類型樣式之後 */
+        .attack-button.selected.btn-syn,
+        .attack-button.selected.btn-http,
+        .attack-button.selected.btn-slowloris,
+        .attack-button.selected.btn-udp,
+        .attack-button.selected.btn-combo {
+            background: rgba(59, 130, 246, 0.3) !important;
+            border-color: #3b82f6 !important;
+            box-shadow: 0 0 20px rgba(59, 130, 246, 0.6) !important;
+            transform: scale(1.05);
+        }
         
         .progress-section {
             grid-column: 1 / -1;
@@ -386,36 +422,42 @@
                         <div class="icon">🟡</div>
                         <div class="name">SYN Flood</div>
                         <div class="desc">半開連接攻擊</div>
+                        <div class="latency-display" id="latency-syn">📊 就緒</div>
                     </button>
                     
                     <button class="attack-button btn-http" data-attack="http-get">
                         <div class="icon">🟢</div>
                         <div class="name">HTTP GET</div>
                         <div class="desc">應用層 GET 請求</div>
+                        <div class="latency-display" id="latency-http-get">📊 就緒</div>
                     </button>
                     
                     <button class="attack-button btn-http" data-attack="http-post">
                         <div class="icon">🟢</div>
                         <div class="name">HTTP POST</div>
                         <div class="desc">應用層 POST 請求</div>
+                        <div class="latency-display" id="latency-http-post">📊 就緒</div>
                     </button>
                     
                     <button class="attack-button btn-slowloris" data-attack="slowloris">
                         <div class="icon">🟣</div>
                         <div class="name">Slowloris</div>
                         <div class="desc">慢速連接耗盡</div>
+                        <div class="latency-display" id="latency-slowloris">📊 就緒</div>
                     </button>
                     
                     <button class="attack-button btn-udp" data-attack="udp">
                         <div class="icon">🔵</div>
                         <div class="name">UDP Flood</div>
                         <div class="desc">UDP 洪水攻擊</div>
+                        <div class="latency-display" id="latency-udp">📊 就緒</div>
                     </button>
                     
                     <button class="attack-button btn-combo" data-attack="combo">
                         <div class="icon">🔥</div>
                         <div class="name">組合攻擊</div>
                         <div class="desc">多重攻擊模式</div>
+                        <div class="latency-display" id="latency-combo">📊 就緒</div>
                     </button>
                 </div>
             </div>
@@ -434,16 +476,32 @@
                         <div class="stat-value" id="statPackets">0</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">建立連接</div>
-                        <div class="stat-value" id="statConnections">0</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-label">HTTP 請求</div>
+                        <div class="stat-label">實際請求數</div>
                         <div class="stat-value" id="statRequests">0</div>
                     </div>
                     <div class="stat-card">
-                        <div class="stat-label">運行時間</div>
-                        <div class="stat-value" id="statTime">0s</div>
+                        <div class="stat-label">成功/失敗</div>
+                        <div class="stat-value" id="statSuccess">0/0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">HTTP/2 請求</div>
+                        <div class="stat-value" id="statHttp2">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">HTTP/3 (QUIC)</div>
+                        <div class="stat-value" id="statHttp3">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">重試次數</div>
+                        <div class="stat-value" id="statRetries">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">源端口數</div>
+                        <div class="stat-value" id="statPorts">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">目標 IP 數</div>
+                        <div class="stat-value" id="statIPs">0</div>
                     </div>
                 </div>
                 
@@ -465,17 +523,35 @@
     <script>
         // 全局變量
         let isAttacking = false;
-        let selectedAttack = null;
+        let selectedAttacks = [];  // 改為陣列支援多選
         let startTime = null;
         let progressInterval = null;
         let statsInterval = null;
+        let latencyInterval = null;
         let attackWorkers = [];
         
         // 統計數據
         const stats = {
             packets: 0,
             connections: 0,
-            requests: 0
+            requests: 0,
+            retries: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            http2_requests: 0,
+            http3_requests: 0,
+            unique_source_ports: 0,
+            resolved_ips_count: 0
+        };
+        
+        // 延遲數據
+        const latencyData = {
+            'syn': [],
+            'http-get': [],
+            'http-post': [],
+            'slowloris': [],
+            'udp': [],
+            'combo': []
         };
         
         // DOM 元素
@@ -500,16 +576,36 @@
             durationValue.textContent = e.target.value;
         });
         
-        // 攻擊類型選擇
+        // 攻擊類型選擇 - 支援多選
         attackButtons.forEach(btn => {
             btn.addEventListener('click', () => {
-                if (isAttacking) return;
+                console.log('按鈕被點擊:', btn.dataset.attack);
                 
-                attackButtons.forEach(b => b.classList.remove('active'));
-                btn.classList.add('active');
-                selectedAttack = btn.dataset.attack;
+                if (isAttacking) {
+                    console.log('攻擊進行中，忽略點擊');
+                    return;
+                }
                 
-                addLog('info', `已選擇攻擊類型: ${btn.querySelector('.name').textContent}`);
+                const attackType = btn.dataset.attack;
+                const index = selectedAttacks.indexOf(attackType);
+                
+                if (index > -1) {
+                    // 取消選擇
+                    selectedAttacks.splice(index, 1);
+                    btn.classList.remove('selected');
+                    console.log('取消選擇:', attackType, '當前選擇:', selectedAttacks);
+                    addLog('info', `取消選擇: ${btn.querySelector('.name').textContent}`);
+                } else {
+                    // 添加選擇
+                    selectedAttacks.push(attackType);
+                    btn.classList.add('selected');
+                    console.log('添加選擇:', attackType, '當前選擇:', selectedAttacks);
+                    addLog('info', `已選擇: ${btn.querySelector('.name').textContent}`);
+                }
+                
+                if (selectedAttacks.length > 0) {
+                    addLog('success', `當前已選 ${selectedAttacks.length} 種攻擊類型`);
+                }
             });
         });
         
@@ -523,8 +619,8 @@
         btnReset.addEventListener('click', resetAll);
         
         function startAttack() {
-            if (!selectedAttack) {
-                addLog('error', '請先選擇攻擊類型！');
+            if (selectedAttacks.length === 0) {
+                addLog('error', '請先選擇至少一種攻擊類型！');
                 return;
             }
             
@@ -545,9 +641,10 @@
             btnStop.disabled = false;
             attackButtons.forEach(btn => btn.disabled = true);
             
-            addLog('success', `開始攻擊: ${selectedAttack}`);
+            addLog('success', `開始多重攻擊: ${selectedAttacks.join(', ')}`);
             addLog('info', `目標: ${targetIp}:${targetPort}`);
             addLog('info', `線程數: ${threadCount}, 持續: ${duration}秒`);
+            addLog('info', `🎯 同時執行 ${selectedAttacks.length} 種攻擊模式`);
             
             // 啟動進度更新
             updateProgress(duration);
@@ -555,8 +652,13 @@
             // 啟動統計更新
             statsInterval = setInterval(updateStats, 500);
             
-            // 根據攻擊類型啟動 Web Workers
-            launchAttack(selectedAttack, targetIp, targetPort, udpPort, threadCount, duration);
+            // 啟動延遲更新
+            latencyInterval = setInterval(updateLatency, 300);
+            
+            // 為每種選擇的攻擊類型啟動獨立線程
+            selectedAttacks.forEach(attackType => {
+                launchAttack(attackType, targetIp, targetPort, udpPort, threadCount, duration);
+            });
         }
         
         function stopAttack() {
@@ -575,6 +677,20 @@
                 statsInterval = null;
             }
             
+            if (latencyInterval) {
+                clearInterval(latencyInterval);
+                latencyInterval = null;
+            }
+            
+            // 重置延遲顯示
+            Object.keys(latencyData).forEach(type => {
+                const elem = document.getElementById(`latency-${type}`);
+                if (elem) {
+                    elem.textContent = '📊 就緒';
+                    elem.className = 'latency-display';
+                }
+            });
+            
             // 發送停止請求到後端
             sendStopRequest();
             
@@ -590,20 +706,28 @@
         function resetAll() {
             stopAttack();
             
-            stats.packets = 0;
-            stats.connections = 0;
-            stats.requests = 0;
+            // 重置統計
+            Object.keys(stats).forEach(key => {
+                stats[key] = 0;
+            });
             
+            // 重置選擇
+            selectedAttacks = [];
+            attackButtons.forEach(btn => btn.classList.remove('selected'));
+            
+            // 重置顯示
             document.getElementById('statPackets').textContent = '0';
-            document.getElementById('statConnections').textContent = '0';
             document.getElementById('statRequests').textContent = '0';
+            document.getElementById('statSuccess').textContent = '0/0';
+            document.getElementById('statHttp2').textContent = '0';
+            document.getElementById('statHttp3').textContent = '0';
+            document.getElementById('statRetries').textContent = '0';
+            document.getElementById('statPorts').textContent = '0';
+            document.getElementById('statIPs').textContent = '0';
             document.getElementById('statTime').textContent = '0s';
             
             progressFill.style.width = '0%';
             progressText.textContent = '0%';
-            
-            attackButtons.forEach(btn => btn.classList.remove('active'));
-            selectedAttack = null;
             
             logSection.innerHTML = '';
             addLog('info', '已重置所有數據');
@@ -626,10 +750,47 @@
             }, 100);
         }
         
+        function updateLatency() {
+            // 從後端獲取延遲數據
+            fetch('http://localhost:5000/api/latency')
+                .then(res => res.json())
+                .then(data => {
+                    console.log('收到延遲數據:', data);
+                    Object.keys(data).forEach(attackType => {
+                        const latency = data[attackType];
+                        const elem = document.getElementById(`latency-${attackType}`);
+                        
+                        if (elem && latency !== null && latency !== undefined) {
+                            // 更新延遲顯示
+                            elem.textContent = `⏱️ ${latency.toFixed(1)}ms`;
+                            
+                            // 根據延遲設置顏色
+                            elem.className = 'latency-display';
+                            if (latency > 1000) {
+                                elem.classList.add('critical');
+                            } else if (latency > 500) {
+                                elem.classList.add('high');
+                            }
+                            
+                            console.log(`更新 ${attackType} 延遲: ${latency.toFixed(1)}ms`);
+                        }
+                    });
+                })
+                .catch(err => {
+                    console.error('獲取延遲數據失敗:', err);
+                });
+        }
+        
         function updateStats() {
             document.getElementById('statPackets').textContent = stats.packets.toLocaleString();
-            document.getElementById('statConnections').textContent = stats.connections.toLocaleString();
             document.getElementById('statRequests').textContent = stats.requests.toLocaleString();
+            document.getElementById('statSuccess').textContent = 
+                `${stats.successful_requests.toLocaleString()}/${stats.failed_requests.toLocaleString()}`;
+            document.getElementById('statHttp2').textContent = stats.http2_requests.toLocaleString();
+            document.getElementById('statHttp3').textContent = stats.http3_requests.toLocaleString();
+            document.getElementById('statRetries').textContent = stats.retries.toLocaleString();
+            document.getElementById('statPorts').textContent = stats.unique_source_ports.toLocaleString();
+            document.getElementById('statIPs').textContent = stats.resolved_ips_count || 0;
             
             if (startTime) {
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -658,6 +819,9 @@
                 
                 if (result.success) {
                     addLog('success', result.message);
+                    if (result.resolved_ips && result.resolved_ips.length > 0) {
+                        addLog('info', `DNS 解析: ${result.resolved_ips.join(', ')}`);
+                    }
                     
                     // 開始輪詢統計數據
                     pollStats();
@@ -681,6 +845,13 @@
                 stats.packets = data.packets;
                 stats.connections = data.connections;
                 stats.requests = data.requests;
+                stats.retries = data.retries || 0;
+                stats.successful_requests = data.successful_requests || 0;
+                stats.failed_requests = data.failed_requests || 0;
+                stats.http2_requests = data.http2_requests || 0;
+                stats.http3_requests = data.http3_requests || 0;
+                stats.unique_source_ports = data.unique_source_ports || 0;
+                stats.resolved_ips_count = data.resolved_ips_count || 0;
                 
                 setTimeout(pollStats, 500);
             } catch (error) {

