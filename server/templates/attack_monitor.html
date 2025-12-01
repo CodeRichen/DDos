@@ -81,6 +81,11 @@
             font-size: 1.3em;
             font-weight: bold;
             color: #ffffff;
+            transition: color 0.2s ease;
+        }
+        
+        .attack-type-count.updating {
+            color: #fbbf24;
         }
         
         /* 右側面板 */
@@ -239,13 +244,20 @@
             font-size: 0.7em;
             color: #c084fc;
             font-weight: bold;
-            margin-bottom: 4px;
+            margin-bottom: 6px;
             display: flex;
             align-items: center;
             gap: 4px;
         }
         
         .operations-list {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            column-gap: 12px;
+        }
+        
+        .operations-column {
             display: flex;
             flex-direction: column;
             gap: 2px;
@@ -256,6 +268,7 @@
             color: #e0e7ff;
             font-family: 'Consolas', 'Courier New', monospace;
             padding: 2px 0;
+            line-height: 1.3;
         }
         
         .operation-step:before {
@@ -367,7 +380,7 @@
             
             <!-- 下方：攻擊事件列表 -->
             <div class="attacks-list-card">
-                <h2>📋 攻擊事件 (最近 50 條)</h2>
+                <h2>📋 攻擊事件 (最近 5 條)</h2>
                 <div class="attacks-list" id="attacksList">
                     <div class="attack-item">
                         <div class="attack-header">
@@ -524,12 +537,27 @@
             const sortedEntries = Object.entries(types).sort((a, b) => b[1] - a[1]);
             const container = document.getElementById('attackTypesList');
             
-            container.innerHTML = sortedEntries.map(([type, count]) => `
-                <div class="attack-type-item">
-                    <span class="attack-type-name">${escapeHtml(type)}</span>
-                    <span class="attack-type-count">${count}</span>
-                </div>
-            `).join('');
+            container.innerHTML = sortedEntries.map(([type, count]) => {
+                const countId = `count-${type.replace(/\s+/g, '-')}`;
+                return `
+                    <div class="attack-type-item">
+                        <span class="attack-type-name">${escapeHtml(type)}</span>
+                        <span class="attack-type-count" id="${countId}">${count}</span>
+                    </div>
+                `;
+            }).join('');
+            
+            // 為每個數字添加變色效果
+            sortedEntries.forEach(([type, count]) => {
+                const countId = `count-${type.replace(/\s+/g, '-')}`;
+                const element = document.getElementById(countId);
+                if (element) {
+                    element.classList.add('updating');
+                    setTimeout(() => {
+                        element.classList.remove('updating');
+                    }, 300);
+                }
+            });
         }
         
         function updateTopIps(ips) {
@@ -549,10 +577,16 @@
             const reversed = [...attacks].reverse();
             
             container.innerHTML = reversed.map((attack) => {
-                // 構建底層操作步驟 HTML
+                // 構建底層操作步驟 HTML（三欄顯示，每欄5行）
                 let operationsHtml = '';
                 if (attack.operations && attack.operations.length > 0) {
-                    const operationsList = attack.operations.map(op => 
+                    // 將操作步驟分成三欄，每欄最多5個
+                    const opsPerColumn = 5;
+                    const col1 = attack.operations.slice(0, opsPerColumn);
+                    const col2 = attack.operations.slice(opsPerColumn, opsPerColumn * 2);
+                    const col3 = attack.operations.slice(opsPerColumn * 2, opsPerColumn * 3);
+                    
+                    const createColumn = (ops) => ops.map(op => 
                         `<div class="operation-step">${escapeHtml(op)}</div>`
                     ).join('');
                     
@@ -562,7 +596,9 @@
                                 🔧 伺服器底層操作步驟 (${attack.operations.length} 步)
                             </div>
                             <div class="operations-list">
-                                ${operationsList}
+                                <div class="operations-column">${createColumn(col1)}</div>
+                                <div class="operations-column">${createColumn(col2)}</div>
+                                <div class="operations-column">${createColumn(col3)}</div>
                             </div>
                         </div>
                     `;

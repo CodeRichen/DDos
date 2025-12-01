@@ -133,9 +133,10 @@ class AttackMonitor:
         }
         self.attack_types = Counter()
         self.source_ips = Counter()
-        self.recent_attacks = deque(maxlen=50)  # 保留最近 50 條
+        self.recent_attacks = deque(maxlen=5)  # 保留最近 5 條
         self.lock = threading.Lock()
         self.start_time = time.time()
+        self.process = psutil.Process()  # 當前進程
     
     def record_attack(self, attack_type, source_ip, details="", operations=None, features=None):
         """記錄攻擊事件（含底層操作）"""
@@ -166,11 +167,14 @@ class AttackMonitor:
             # 返回所有 50 條攻擊記錄
             recent = list(self.recent_attacks)
             
-            # 獲取系統資源
+            # 獲取系統資源（只計算當前進程）
             try:
-                cpu_percent = psutil.cpu_percent(interval=0.1)
-                memory = psutil.virtual_memory()
-                memory_percent = memory.percent
+                # 當前進程的 CPU 使用率
+                cpu_percent = self.process.cpu_percent(interval=0.1)
+                # 當前進程的記憶體使用
+                memory_info = self.process.memory_info()
+                memory_percent = (memory_info.rss / psutil.virtual_memory().total) * 100
+                # 網路統計（全局）
                 net_io = psutil.net_io_counters()
                 net_sent_kb = net_io.bytes_sent / 1024
                 net_recv_kb = net_io.bytes_recv / 1024

