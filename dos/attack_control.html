@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>DDoS 攻擊控制台</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: white;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        
+        .warning {
+            background: rgba(255, 152, 0, 0.2);
+            border: 2px solid #ff9800;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        .control-panel {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .card {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 20px;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .card h2 {
+            margin-bottom: 15px;
+            color: #fbbf24;
+            font-size: 1.3em;
+        }
+        
+        .target-config {
+            margin-bottom: 15px;
+        }
+        
+        .target-config label {
+            display: block;
+            margin-bottom: 5px;
+            color: #a8dadc;
+            font-size: 0.9em;
+        }
+        
+        .target-config input {
+            width: 100%;
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.3);
+            background: rgba(0,0,0,0.3);
+            color: white;
+            font-size: 1em;
+        }
+        
+        .slider-container {
+            margin: 20px 0;
+        }
+        
+        .slider-label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        
+        .slider-label span {
+            color: #a8dadc;
+        }
+        
+        .slider-value {
+            color: #4ade80;
+            font-weight: bold;
+            font-size: 1.2em;
+        }
+        
+        input[type="range"] {
+            width: 100%;
+            height: 8px;
+            border-radius: 5px;
+            background: rgba(255,255,255,0.2);
+            outline: none;
+            -webkit-appearance: none;
+        }
+        
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #4ade80;
+            cursor: pointer;
+        }
+        
+        input[type="range"]::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #4ade80;
+            cursor: pointer;
+        }
+        
+        .attack-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 15px;
+        }
+        
+        .attack-button {
+            padding: 15px;
+            border-radius: 10px;
+            border: 2px solid;
+            background: rgba(0,0,0,0.3);
+            color: white;
+            font-size: 1em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-align: left;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .attack-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
+        
+        .attack-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .attack-button.active {
+            background: rgba(76, 222, 128, 0.2);
+            animation: pulse-glow 2s infinite;
+        }
+        
+        @keyframes pulse-glow {
+            0%, 100% { box-shadow: 0 0 10px rgba(76, 222, 128, 0.5); }
+            50% { box-shadow: 0 0 20px rgba(76, 222, 128, 0.8); }
+        }
+        
+        .attack-button .icon {
+            font-size: 1.5em;
+            margin-bottom: 5px;
+        }
+        
+        .attack-button .name {
+            font-size: 1.1em;
+            margin-bottom: 5px;
+        }
+        
+        .attack-button .desc {
+            font-size: 0.8em;
+            color: #cbd5e1;
+        }
+        
+        .btn-icmp { border-color: #3b82f6; }
+        .btn-syn { border-color: #ef4444; }
+        .btn-http { border-color: #10b981; }
+        .btn-slowloris { border-color: #8b5cf6; }
+        .btn-udp { border-color: #06b6d4; }
+        .btn-combo { border-color: #f59e0b; }
+        
+        .progress-section {
+            grid-column: 1 / -1;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 40px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 20px;
+            overflow: hidden;
+            position: relative;
+            margin-top: 10px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4ade80, #22c55e);
+            width: 0%;
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+        }
+        
+        .progress-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-weight: bold;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.5);
+        }
+        
+        .stats-section {
+            grid-column: 1 / -1;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .stat-card {
+            background: rgba(0,0,0,0.3);
+            padding: 15px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #4ade80;
+            margin: 10px 0;
+        }
+        
+        .stat-label {
+            color: #a8dadc;
+            font-size: 0.9em;
+        }
+        
+        .control-buttons {
+            display: flex;
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .btn {
+            flex: 1;
+            padding: 15px;
+            border-radius: 10px;
+            border: none;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-start {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: white;
+        }
+        
+        .btn-stop {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: white;
+        }
+        
+        .btn-reset {
+            background: linear-gradient(135deg, #6b7280, #4b5563);
+            color: white;
+        }
+        
+        .log-section {
+            margin-top: 20px;
+            background: rgba(0,0,0,0.5);
+            border-radius: 10px;
+            padding: 15px;
+            height: 300px;
+            overflow-y: auto;
+        }
+        
+        .log-entry {
+            padding: 8px;
+            margin-bottom: 5px;
+            border-radius: 5px;
+            background: rgba(255,255,255,0.05);
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        
+        .log-info { border-left: 3px solid #3b82f6; }
+        .log-success { border-left: 3px solid #10b981; }
+        .log-warning { border-left: 3px solid #f59e0b; }
+        .log-error { border-left: 3px solid #ef4444; }
+        
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(0,0,0,0.2);
+            border-radius: 4px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255,255,255,0.3);
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>💣 DDoS 攻擊控制台</h1>
+        
+        <div class="warning">
+            ⚠️ 警告：此工具僅供測試自己的伺服器使用。未經授權攻擊他人伺服器屬於違法行為！
+        </div>
+        
+        <div class="control-panel">
+            <!-- 目標配置 -->
+            <div class="card">
+                <h2>🎯 目標配置</h2>
+                <div class="target-config">
+                    <label>目標 IP 地址</label>
+                    <input type="text" id="targetIp" value="127.0.0.1">
+                </div>
+                <div class="target-config">
+                    <label>TCP 端口</label>
+                    <input type="number" id="targetPort" value="8000">
+                </div>
+                <div class="target-config">
+                    <label>UDP 端口</label>
+                    <input type="number" id="udpPort" value="9001">
+                </div>
+            </div>
+            
+            <!-- 攻擊參數 -->
+            <div class="card">
+                <h2>⚙️ 攻擊參數</h2>
+                
+                <div class="slider-container">
+                    <div class="slider-label">
+                        <span>線程數量</span>
+                        <span class="slider-value" id="threadValue">50</span>
+                    </div>
+                    <input type="range" id="threadSlider" min="1" max="200" value="50">
+                </div>
+                
+                <div class="slider-container">
+                    <div class="slider-label">
+                        <span>持續時間 (秒)</span>
+                        <span class="slider-value" id="durationValue">30</span>
+                    </div>
+                    <input type="range" id="durationSlider" min="5" max="300" value="30">
+                </div>
+            </div>
+            
+            <!-- 攻擊類型選擇 -->
+            <div class="card">
+                <h2>🚀 攻擊類型</h2>
+                <div class="attack-grid">
+                    <button class="attack-button btn-syn" data-attack="syn">
+                        <div class="icon">🟡</div>
+                        <div class="name">SYN Flood</div>
+                        <div class="desc">半開連接攻擊</div>
+                    </button>
+                    
+                    <button class="attack-button btn-http" data-attack="http-get">
+                        <div class="icon">🟢</div>
+                        <div class="name">HTTP GET</div>
+                        <div class="desc">應用層 GET 請求</div>
+                    </button>
+                    
+                    <button class="attack-button btn-http" data-attack="http-post">
+                        <div class="icon">🟢</div>
+                        <div class="name">HTTP POST</div>
+                        <div class="desc">應用層 POST 請求</div>
+                    </button>
+                    
+                    <button class="attack-button btn-slowloris" data-attack="slowloris">
+                        <div class="icon">🟣</div>
+                        <div class="name">Slowloris</div>
+                        <div class="desc">慢速連接耗盡</div>
+                    </button>
+                    
+                    <button class="attack-button btn-udp" data-attack="udp">
+                        <div class="icon">🔵</div>
+                        <div class="name">UDP Flood</div>
+                        <div class="desc">UDP 洪水攻擊</div>
+                    </button>
+                    
+                    <button class="attack-button btn-combo" data-attack="combo">
+                        <div class="icon">🔥</div>
+                        <div class="name">組合攻擊</div>
+                        <div class="desc">多重攻擊模式</div>
+                    </button>
+                </div>
+            </div>
+            
+            <!-- 進度與統計 -->
+            <div class="card progress-section">
+                <h2>📊 攻擊進度</h2>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                    <div class="progress-text" id="progressText">0%</div>
+                </div>
+                
+                <div class="stats-section">
+                    <div class="stat-card">
+                        <div class="stat-label">發送封包</div>
+                        <div class="stat-value" id="statPackets">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">建立連接</div>
+                        <div class="stat-value" id="statConnections">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">HTTP 請求</div>
+                        <div class="stat-value" id="statRequests">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">運行時間</div>
+                        <div class="stat-value" id="statTime">0s</div>
+                    </div>
+                </div>
+                
+                <div class="control-buttons">
+                    <button class="btn btn-start" id="btnStart">▶️ 開始攻擊</button>
+                    <button class="btn btn-stop" id="btnStop" disabled>⏹️ 停止攻擊</button>
+                    <button class="btn btn-reset" id="btnReset">🔄 重置</button>
+                </div>
+            </div>
+            
+            <!-- 日誌 -->
+            <div class="card" style="grid-column: 1 / -1;">
+                <h2>📋 攻擊日誌</h2>
+                <div class="log-section" id="logSection"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // 全局變量
+        let isAttacking = false;
+        let selectedAttack = null;
+        let startTime = null;
+        let progressInterval = null;
+        let statsInterval = null;
+        let attackWorkers = [];
+        
+        // 統計數據
+        const stats = {
+            packets: 0,
+            connections: 0,
+            requests: 0
+        };
+        
+        // DOM 元素
+        const threadSlider = document.getElementById('threadSlider');
+        const threadValue = document.getElementById('threadValue');
+        const durationSlider = document.getElementById('durationSlider');
+        const durationValue = document.getElementById('durationValue');
+        const attackButtons = document.querySelectorAll('.attack-button');
+        const btnStart = document.getElementById('btnStart');
+        const btnStop = document.getElementById('btnStop');
+        const btnReset = document.getElementById('btnReset');
+        const progressFill = document.getElementById('progressFill');
+        const progressText = document.getElementById('progressText');
+        const logSection = document.getElementById('logSection');
+        
+        // 滑桿更新
+        threadSlider.addEventListener('input', (e) => {
+            threadValue.textContent = e.target.value;
+        });
+        
+        durationSlider.addEventListener('input', (e) => {
+            durationValue.textContent = e.target.value;
+        });
+        
+        // 攻擊類型選擇
+        attackButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                if (isAttacking) return;
+                
+                attackButtons.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                selectedAttack = btn.dataset.attack;
+                
+                addLog('info', `已選擇攻擊類型: ${btn.querySelector('.name').textContent}`);
+            });
+        });
+        
+        // 開始攻擊
+        btnStart.addEventListener('click', startAttack);
+        
+        // 停止攻擊
+        btnStop.addEventListener('click', stopAttack);
+        
+        // 重置
+        btnReset.addEventListener('click', resetAll);
+        
+        function startAttack() {
+            if (!selectedAttack) {
+                addLog('error', '請先選擇攻擊類型！');
+                return;
+            }
+            
+            const targetIp = document.getElementById('targetIp').value;
+            const targetPort = parseInt(document.getElementById('targetPort').value);
+            const udpPort = parseInt(document.getElementById('udpPort').value);
+            const threadCount = parseInt(threadSlider.value);
+            const duration = parseInt(durationSlider.value);
+            
+            if (!targetIp || !targetPort) {
+                addLog('error', '請填寫完整的目標配置！');
+                return;
+            }
+            
+            isAttacking = true;
+            startTime = Date.now();
+            btnStart.disabled = true;
+            btnStop.disabled = false;
+            attackButtons.forEach(btn => btn.disabled = true);
+            
+            addLog('success', `開始攻擊: ${selectedAttack}`);
+            addLog('info', `目標: ${targetIp}:${targetPort}`);
+            addLog('info', `線程數: ${threadCount}, 持續: ${duration}秒`);
+            
+            // 啟動進度更新
+            updateProgress(duration);
+            
+            // 啟動統計更新
+            statsInterval = setInterval(updateStats, 500);
+            
+            // 根據攻擊類型啟動 Web Workers
+            launchAttack(selectedAttack, targetIp, targetPort, udpPort, threadCount, duration);
+        }
+        
+        function stopAttack() {
+            isAttacking = false;
+            btnStart.disabled = false;
+            btnStop.disabled = true;
+            attackButtons.forEach(btn => btn.disabled = false);
+            
+            if (progressInterval) {
+                clearInterval(progressInterval);
+                progressInterval = null;
+            }
+            
+            if (statsInterval) {
+                clearInterval(statsInterval);
+                statsInterval = null;
+            }
+            
+            // 發送停止請求到後端
+            sendStopRequest();
+            
+            addLog('warning', '攻擊已停止');
+            
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+            addLog('info', `總運行時間: ${elapsed}秒`);
+            addLog('info', `發送封包: ${stats.packets.toLocaleString()}`);
+            addLog('info', `建立連接: ${stats.connections.toLocaleString()}`);
+            addLog('info', `HTTP 請求: ${stats.requests.toLocaleString()}`);
+        }
+        
+        function resetAll() {
+            stopAttack();
+            
+            stats.packets = 0;
+            stats.connections = 0;
+            stats.requests = 0;
+            
+            document.getElementById('statPackets').textContent = '0';
+            document.getElementById('statConnections').textContent = '0';
+            document.getElementById('statRequests').textContent = '0';
+            document.getElementById('statTime').textContent = '0s';
+            
+            progressFill.style.width = '0%';
+            progressText.textContent = '0%';
+            
+            attackButtons.forEach(btn => btn.classList.remove('active'));
+            selectedAttack = null;
+            
+            logSection.innerHTML = '';
+            addLog('info', '已重置所有數據');
+        }
+        
+        function updateProgress(duration) {
+            const startTime = Date.now();
+            
+            progressInterval = setInterval(() => {
+                const elapsed = (Date.now() - startTime) / 1000;
+                const progress = Math.min((elapsed / duration) * 100, 100);
+                
+                progressFill.style.width = progress + '%';
+                progressText.textContent = progress.toFixed(1) + '%';
+                
+                if (progress >= 100) {
+                    clearInterval(progressInterval);
+                    stopAttack();
+                }
+            }, 100);
+        }
+        
+        function updateStats() {
+            document.getElementById('statPackets').textContent = stats.packets.toLocaleString();
+            document.getElementById('statConnections').textContent = stats.connections.toLocaleString();
+            document.getElementById('statRequests').textContent = stats.requests.toLocaleString();
+            
+            if (startTime) {
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                document.getElementById('statTime').textContent = elapsed + 's';
+            }
+        }
+        
+        async function launchAttack(type, ip, port, udpPort, threads, duration) {
+            try {
+                const response = await fetch('/api/start', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        type: type,
+                        ip: ip,
+                        port: port,
+                        udpPort: udpPort,
+                        threads: threads,
+                        duration: duration
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    addLog('success', result.message);
+                    
+                    // 開始輪詢統計數據
+                    pollStats();
+                } else {
+                    addLog('error', result.error);
+                    stopAttack();
+                }
+            } catch (error) {
+                addLog('error', '無法連接到後端服務器: ' + error.message);
+                stopAttack();
+            }
+        }
+        
+        async function pollStats() {
+            if (!isAttacking) return;
+            
+            try {
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+                
+                stats.packets = data.packets;
+                stats.connections = data.connections;
+                stats.requests = data.requests;
+                
+                setTimeout(pollStats, 500);
+            } catch (error) {
+                console.error('獲取統計數據失敗:', error);
+                setTimeout(pollStats, 1000);
+            }
+        }
+        
+        async function sendStopRequest() {
+            try {
+                const response = await fetch('/api/stop', {
+                    method: 'POST'
+                });
+                const result = await response.json();
+                addLog('info', result.message);
+            } catch (error) {
+                addLog('error', '停止請求失敗: ' + error.message);
+            }
+        }
+        
+        function addLog(type, message) {
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            const timestamp = new Date().toLocaleTimeString();
+            entry.textContent = `[${timestamp}] ${message}`;
+            
+            logSection.insertBefore(entry, logSection.firstChild);
+            
+            // 限制日誌條目數量
+            while (logSection.children.length > 50) {
+                logSection.removeChild(logSection.lastChild);
+            }
+        }
+        
+        // 初始化
+        addLog('info', '攻擊控制台已就緒');
+        addLog('warning', '請確保目標伺服器是您自己的測試伺服器');
+    </script>
+</body>
+</html>
