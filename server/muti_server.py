@@ -668,8 +668,28 @@ class WebSocketHandler(SimpleHTTPRequestHandler):
             
             print(f"✅ WebSocket 客戶端已連接，當前連接數: {len(websocket_clients)}")
             
-            while True:
-                time.sleep(1)
+            # 保持連接打開 - 使用阻塞模式但設置超時
+            self.connection.setblocking(True)
+            self.connection.settimeout(None)  # 無超時，保持連接
+            
+            try:
+                # 持續讀取，直到連接關閉
+                while True:
+                    try:
+                        # 接收數據（阻塞式）
+                        data = self.connection.recv(1024, socket.MSG_PEEK)
+                        if not data:
+                            # 連接已關閉
+                            break
+                        # 實際讀取數據
+                        self.connection.recv(1024)
+                    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
+                        # 連接錯誤
+                        break
+                    except Exception:
+                        break
+            except KeyboardInterrupt:
+                pass
         
         except Exception as e:
             print(f"WebSocket 錯誤: {e}")
